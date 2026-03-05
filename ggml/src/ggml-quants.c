@@ -388,6 +388,26 @@ void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+void dequantize_row_q4_hqq(const block_q4_hqq * x, float * y, int k) {
+
+    const int nb = k / QK4_HQQ;
+
+    for (int i = 0; i < nb; i++) {
+
+        const float scale = GGML_FP16_TO_FP32(x[i].scale);
+        const float zero  = GGML_FP16_TO_FP32(x[i].zero);
+
+        for (int j = 0; j < QK4_HQQ; j++) {
+
+            uint8_t q = x[i].qs[j/2];
+
+            int qi = (j % 2 == 0) ? (q >> 4) : (q & 0xF);
+
+            y[i*QK4_HQQ + j] = (qi - zero) / scale;
+        }
+    }
+}
+
 void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK5_0;
 
