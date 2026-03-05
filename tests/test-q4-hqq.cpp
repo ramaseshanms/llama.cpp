@@ -3,7 +3,7 @@
 #include <vector>
 
 extern "C" {
-#include "ggml-quants.h"
+#include "../ggml/src/ggml-quants.h"
 }
 
 int main() {
@@ -20,7 +20,7 @@ int main() {
     std::vector<block_q4_hqq> q(nb);
     std::vector<float> output(N);
 
-    quantize_row_q4_hqq(input.data(), q.data(), N);
+    quantize_row_q4_hqq_ref(input.data(), q.data(), N);
     dequantize_row_q4_hqq(q.data(), output.data(), nb * QK4_HQQ);
 
     float mse = 0;
@@ -33,6 +33,8 @@ int main() {
     mse /= N;
 
     assert(mse < 0.05);
+    printf("MSE = %f\n", mse);
+    printf("Q4_HQQ test passed\n");
 
     return 0;
 }
