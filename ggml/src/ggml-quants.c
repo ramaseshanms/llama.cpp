@@ -107,6 +107,49 @@ void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_REST
     }
 }
 
+void quantize_row_q4_hqq_ref(const float * GGML_RESTRICT x,
+                             block_q4_hqq * GGML_RESTRICT y,
+                             int64_t k) {
+
+    const int qk = QK4_HQQ;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+
+        float min = FLT_MAX;
+        float max = -FLT_MAX;
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+
+        float scale = (max - min) ? 15.0f / (max - min) : 0.0f;
+        float zero  = -min * scale;
+
+        y[i].scale = GGML_FP32_TO_FP16(scale);
+        y[i].zero  = GGML_FP32_TO_FP16(zero);
+
+        for (int j = 0; j < qk/2; ++j) {
+
+            const float v0 = x[i*qk + j*2 + 0];
+            const float v1 = x[i*qk + j*2 + 1];
+
+            int q0 = (int) roundf(v0 * scale + zero);
+            int q1 = (int) roundf(v1 * scale + zero);
+
+            q0 = MAX(0, MIN(15, q0));
+            q1 = MAX(0, MIN(15, q1));
+
+            y[i].qs[j] = q0 | (q1 << 4);
+        }
+    }
+}
+
 void quantize_row_q5_0_ref(const float * GGML_RESTRICT x, block_q5_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK5_0;
 
@@ -1961,6 +2004,22 @@ static void quantize_row_q4_1_impl(const float * GGML_RESTRICT x, block_q4_1 * G
             y[ib].qs[j] = L[j] | (L[j+16] << 4);
         }
     }
+}
+
+static void quantize_row_q4_hqq_impl(const float * GGML_RESTRICT x,
+                                     block_q4_hqq * GGML_RESTRICT y,
+                                     int64_t n_per_row,
+                                     const float * quant_weights) {
+
+    static_assert(QK4_HQQ == 32, "QK4_HQQ must be 32");
+
+    if (!quant_weights) {
+        quantize_row_q4_hqq_ref(x, y, n_per_row);
+        return;
+    }
+
+    // weighted quantization not implemented for HQQ
+    quantize_row_q4_hqq_ref(x, y, n_per_row);
 }
 
 size_t quantize_q4_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
