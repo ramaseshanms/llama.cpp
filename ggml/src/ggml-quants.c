@@ -2057,6 +2057,18 @@ size_t quantize_q4_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+void quantize_row_q4_hqq(
+        const float * GGML_RESTRICT x,
+        void * GGML_RESTRICT y,
+        int64_t k) {
+
+    quantize_row_q4_hqq_ref(
+        x,
+        (block_q4_hqq *) y,
+        k
+    );
+}
+
 size_t quantize_q4_hqq(const float * GGML_RESTRICT src,
                        void * GGML_RESTRICT dst,
                        int64_t nrow,

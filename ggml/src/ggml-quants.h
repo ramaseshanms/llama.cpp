@@ -14,6 +14,10 @@ extern "C" {
 // NOTE: these functions are defined as GGML_API because they used by the CPU backend
 
 // Quantization
+void quantize_row_q4_hqq(
+        const float * GGML_RESTRICT x,
+        void * GGML_RESTRICT y,
+        int64_t k);
 GGML_API void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q4_hqq_ref(const float * GGML_RESTRICT x, block_q4_hqq * GGML_RESTRICT y, int64_t k);
