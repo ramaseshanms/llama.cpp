@@ -2057,6 +2057,29 @@ size_t quantize_q4_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+size_t quantize_q4_hqq(const float * GGML_RESTRICT src,
+                       void * GGML_RESTRICT dst,
+                       int64_t nrow,
+                       int64_t n_per_row,
+                       const float * quant_weights) {
+
+    if (!quant_weights) {
+        quantize_row_q4_hqq_ref(src, dst, (int64_t)nrow * n_per_row);
+        return nrow * ggml_row_size(GGML_TYPE_Q4_HQQ, n_per_row);
+    }
+
+    size_t row_size = ggml_row_size(GGML_TYPE_Q4_HQQ, n_per_row);
+    char * qrow = (char *) dst;
+
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q4_hqq_impl(src, (block_q4_hqq *) qrow, n_per_row, quant_weights);
+        src  += n_per_row;
+        qrow += row_size;
+    }
+
+    return nrow * row_size;
+}
+
 static void quantize_row_q5_0_impl(const float * GGML_RESTRICT x, block_q5_0 * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
     static_assert(QK5_0 == 32, "QK5_0 must be 32");
 
