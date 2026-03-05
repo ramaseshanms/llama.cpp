@@ -388,7 +388,7 @@ void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
-void dequantize_row_q4_hqq(const block_q4_hqq * x, float * y, int k) {
+void dequantize_row_q4_hqq(const block_q4_hqq * x, float * y, int64_t k) {
 
     const int nb = k / QK4_HQQ;
 
