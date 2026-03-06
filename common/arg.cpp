@@ -2158,6 +2158,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
+        {"--mmproj-backend"}, "BACKEND",
+        "backend device to use exclusively for the multimodal projector (e.g. \"CUDA0\", \"Metal\", \"CPU\").\n"
+        "when set, this backend is used for the mmproj only; the base model backend is unchanged.\n"
+        "use --list-devices to see available device names (default: same device as base model)",
+        [](common_params & params, const std::string & value) {
+            params.mmproj_backend  = value;
+            // if an explicit backend is set, honour the implicit intent to use that device
+            // (keep mmproj_use_gpu consistent: a non-CPU device name implies GPU usage)
+            if (value == "CPU" || value == "cpu") {
+                params.mmproj_use_gpu = false;
+            } else {
+                params.mmproj_use_gpu = true;
+            }
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_BACKEND"));
+    add_opt(common_arg(
         {"--image", "--audio"}, "FILE",
         "path to an image or audio file. use with multimodal models, use comma-separated values for multiple files\n",
         [](common_params & params, const std::string & value) {

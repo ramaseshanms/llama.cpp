@@ -143,6 +143,8 @@ struct mtmd_cli_context {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        // --mmproj-backend: route projector to a specific device, base model is unaffected
+        mparams.mmproj_device    = params.mmproj_backend.empty() ? nullptr : params.mmproj_backend.c_str();
         if (std::getenv("MTMD_DEBUG_GRAPH") != nullptr) {
             mparams.cb_eval_user_data = &cb_data;
             mparams.cb_eval = common_debug_cb_eval<false>;

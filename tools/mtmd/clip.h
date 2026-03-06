@@ -38,6 +38,10 @@ struct clip_context_params {
     int image_min_tokens;
     int image_max_tokens;
     bool warmup;
+    // Optional: explicit backend device name for the projector (e.g. "CUDA0", "Metal", "CPU").
+    // When non-NULL and non-empty, overrides the use_gpu field and routes the entire CLIP/projector
+    // computation to the named device.  The base-model backend is never touched by this field.
+    const char * device_name; // nullable; caller must keep alive for the duration of clip_init
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 };

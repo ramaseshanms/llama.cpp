@@ -165,7 +165,25 @@ struct clip_ctx {
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
         }
-        if (ctx_params.use_gpu) {
+        // Backend selection priority:
+        //  1. ctx_params.device_name  — set via --mmproj-backend CLI flag (most specific)
+        //  2. MTMD_BACKEND_DEVICE env var  — legacy env-var override
+        //  3. Default GPU device (when use_gpu == true)
+        //  4. CPU fallback (implicit: backend stays nullptr → assigned to backend_cpu below)
+        //
+        // NOTE: only the mmproj projector graph is routed to this backend.
+        //       The base-model llama_context backend is never modified here.
+        if (ctx_params.device_name && ctx_params.device_name[0] != '\0') {
+            backend = ggml_backend_init_by_name(ctx_params.device_name, nullptr);
+            if (!backend) {
+                LOG_WRN("%s: Warning: Failed to initialize mmproj backend \"%s\" (from --mmproj-backend), "
+                        "falling back to default GPU/CPU backend\n", __func__, ctx_params.device_name);
+            } else {
+                LOG_INF("%s: CLIP mmproj backend set to \"%s\" via --mmproj-backend\n",
+                        __func__, ctx_params.device_name);
+            }
+        }
+        if (!backend && ctx_params.use_gpu) {
             auto backend_name = std::getenv("MTMD_BACKEND_DEVICE");
             if (backend_name != nullptr) {
                 backend = ggml_backend_init_by_name(backend_name, nullptr);

@@ -112,6 +112,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* warmup            */ true,
         /* image_min_tokens  */ -1,
         /* image_max_tokens  */ -1,
+        /* mmproj_device     */ nullptr,
         /* cb_eval           */ nullptr,
         /* cb_eval_user_data */ nullptr,
     };
@@ -179,6 +180,7 @@ struct mtmd_context {
             /* image_min_tokens  */ ctx_params.image_min_tokens,
             /* image_max_tokens  */ ctx_params.image_max_tokens,
             /* warmup            */ ctx_params.warmup,
+            /* device_name       */ ctx_params.mmproj_device,
             /* cb_eval           */ ctx_params.cb_eval,
             /* cb_eval_user_data */ ctx_params.cb_eval_user_data,
         };

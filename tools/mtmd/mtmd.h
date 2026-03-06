@@ -96,6 +96,13 @@ struct mtmd_context_params {
     int image_min_tokens; // minimum number of tokens for image input (default: read from metadata)
     int image_max_tokens; // maximum number of tokens for image input (default: read from metadata)
 
+    // Optional: name of the backend device to use exclusively for the multimodal projector.
+    // When non-NULL and non-empty, the projector graph is scheduled on this specific device
+    // (e.g. "CUDA0", "CUDA1", "Metal", "CPU") independently of the base model's backend.
+    // When NULL or empty, the existing use_gpu logic applies (default GPU or CPU fallback).
+    // The base-model backend is never affected by this field.
+    const char * mmproj_device; // nullable; owned by the caller, must outlive mtmd_context
+
     // callback function passed over to mtmd proper
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
