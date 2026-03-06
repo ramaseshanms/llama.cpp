@@ -134,10 +134,15 @@ void quantize_row_q4_hqq_ref(const float * GGML_RESTRICT x,
         y[i].scale = GGML_FP32_TO_FP16(scale);
         y[i].zero  = GGML_FP32_TO_FP16(zero);
 
+        // Split-half packing: qs[j] low nibble = element j,
+        //                     qs[j] high nibble = element j + qk/2
+        // This matches the vec_dot convention used by all SIMD kernels
+        // (bytes_from_nibbles_32 expands low nibbles to first 16 lanes,
+        //  high nibbles to last 16 lanes, aligned with sequential Q8_0).
         for (int j = 0; j < qk/2; ++j) {
 
-            const float v0 = x[i*qk + j*2 + 0];
-            const float v1 = x[i*qk + j*2 + 1];
+            const float v0 = x[i*qk + j];          // element j        (0..15)
+            const float v1 = x[i*qk + j + qk/2];   // element j+qk/2  (16..31)
 
             int q0 = (int) roundf(v0 * scale + zero);
             int q1 = (int) roundf(v1 * scale + zero);
@@ -397,13 +402,15 @@ void dequantize_row_q4_hqq(const block_q4_hqq * x, float * y, int64_t k) {
         const float scale = GGML_FP16_TO_FP32(x[i].scale);
         const float zero  = GGML_FP16_TO_FP32(x[i].zero);
 
-        for (int j = 0; j < QK4_HQQ; j++) {
+        // Split-half packing: qs[j] low nibble = element j,
+        //                     qs[j] high nibble = element j + QK4_HQQ/2
+        for (int j = 0; j < QK4_HQQ/2; ++j) {
 
-            uint8_t q = x[i].qs[j/2];
+            const int x0 = (x[i].qs[j] & 0x0F);   // element j
+            const int x1 = (x[i].qs[j] >>    4);   // element j + QK4_HQQ/2
 
-            int qi = (j % 2 == 0) ? (q >> 4) : (q & 0xF);
-
-            y[i*QK4_HQQ + j] = (qi - zero) / scale;
+            y[i*QK4_HQQ + j]              = (x0 - zero) / scale;
+            y[i*QK4_HQQ + j + QK4_HQQ/2] = (x1 - zero) / scale;
         }
     }
 }
