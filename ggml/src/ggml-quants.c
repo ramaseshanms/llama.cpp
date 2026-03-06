@@ -323,6 +323,109 @@ static void hqq_optimize_zero(
     *z = best_z;
 }
 
+// -----------------------------------------------------------------------------
+// hqq_optimize_zero_imatrix — importance-weighted HQQ zero-point optimizer.
+//
+// Extends hqq_optimize_zero() by weighting each element's contribution to
+// the early-stopping error and to the SP2 zero-point update by its imatrix
+// importance weight.  Elements with higher activation variance (high iw[j])
+// dominate the zero-point choice, focusing the optimization on the weights
+// that actually matter most for output quality.
+//
+// Differences from hqq_optimize_zero():
+//   Early-stop error:  Σ_j  iw[j] * |W[j] - W_r[j]|   (importance-weighted L1)
+//   SP2 update:        z = (Σ_j iw[j]*(W_q[j]-(W[j]-W_e[j])*s)) / Σ_j iw[j]
+//
+// The imatrix weight iw[j] is typically proportional to the mean-square
+// activation at position j across a calibration corpus.  A higher weight
+// means the weight at that position contributes more to the final output
+// loss, so we want to minimize its quantization error more aggressively.
+//
+// @param W    input weights for this group
+// @param iw   importance weights iw[0..n-1] (positive floats; no-op if NULL)
+// @param s    fixed scale
+// @param z    in/out: initial zero, optimized zero on exit
+// @param n    group size (<= HQQ_MAX_GROUP)
+// @param max_q maximum quantized code (15 for 4-bit)
+// @param p, beta, kappa, iters — same semantics as hqq_optimize_zero()
+// -----------------------------------------------------------------------------
+static void hqq_optimize_zero_imatrix(
+    const float * GGML_RESTRICT W,
+    const float * GGML_RESTRICT iw,
+    float   s,
+    float * z,
+    int     n,
+    int     max_q,
+    float   p,
+    float   beta,
+    float   kappa,
+    int     iters)
+{
+    // No importance weights provided: fall through to the uniform optimizer.
+    if (!iw) {
+        hqq_optimize_zero(W, s, z, n, max_q, p, beta, kappa, iters);
+        return;
+    }
+
+    // Constant group: nothing to optimize.
+    if (s == 0.0f) {
+        return;
+    }
+
+    float W_q[HQQ_MAX_GROUP];
+    float W_e[HQQ_MAX_GROUP];
+
+    float best_z     = *z;
+    float best_error = FLT_MAX;
+
+    for (int t = 0; t < iters; t++) {
+        float error = 0.0f;
+
+        // Forward pass + SP1 (same structure as hqq_optimize_zero).
+        for (int j = 0; j < n; j++) {
+            int q_int = (int)roundf(W[j] * s + *z);
+            q_int = (q_int < 0) ? 0 : (q_int > max_q ? max_q : q_int);
+            W_q[j] = (float)q_int;
+
+            const float W_r   = (W_q[j] - *z) / s;
+            const float resid = W[j] - W_r;
+
+            // Importance-weighted L1 error for early stopping.
+            // Elements with higher iw[j] pull the stopping criterion harder.
+            error += iw[j] * fabsf(resid);
+
+            // SP1 shrinkage is still unweighted — the paper applies shrink_lp
+            // to the raw residual; the weight only affects the zero update.
+            W_e[j] = hqq_shrink_lp(resid, beta, p);
+        }
+
+        // Early stopping on importance-weighted error.
+        if (error < best_error) {
+            best_error = error;
+            best_z     = *z;
+        } else {
+            *z = best_z;
+            return;
+        }
+
+        // SP2: importance-weighted mean.
+        // z = (Σ_j iw[j] * (W_q[j] - (W[j]-W_e[j])*s)) / (Σ_j iw[j])
+        // This is the weighted version of the closed-form argmin from SP2.
+        float sum_wz = 0.0f;
+        float sum_w  = 0.0f;
+        for (int j = 0; j < n; j++) {
+            sum_wz += iw[j] * (W_q[j] - (W[j] - W_e[j]) * s);
+            sum_w  += iw[j];
+        }
+        // Guard against pathological imatrix where all weights are zero.
+        *z = (sum_w > 1e-10f) ? (sum_wz / sum_w) : *z;
+
+        beta *= kappa;
+    }
+
+    *z = best_z;
+}
+
 // =============================================================================
 // End of HQQ solver helpers
 // =============================================================================
@@ -2277,20 +2380,85 @@ static void quantize_row_q4_1_impl(const float * GGML_RESTRICT x, block_q4_1 * G
     }
 }
 
+// quantize_row_q4_hqq_impl — imatrix-aware HQQ quantizer for one row.
+//
+// When quant_weights (imatrix) is NULL the call is forwarded to
+// quantize_row_q4_hqq_ref() which runs the standard HQQ proximal solver
+// with uniform weights.
+//
+// When quant_weights is non-NULL each block's zero-point is optimized using
+// hqq_optimize_zero_imatrix(), which replaces the equal-weight SP2 mean with
+// an importance-weighted mean.  Elements whose positions have higher average
+// activation variance (imatrix value) contribute proportionally more to the
+// zero-point choice, concentrating the optimization budget on the weights that
+// most affect the final model output.
+//
+// The scale is kept fixed at its min/max value for both branches — consistent
+// with the paper's formulation and with the uniform path.
 static void quantize_row_q4_hqq_impl(const float * GGML_RESTRICT x,
                                      block_q4_hqq * GGML_RESTRICT y,
                                      int64_t n_per_row,
                                      const float * quant_weights) {
 
-    static_assert(QK4_HQQ == 32, "QK4_HQQ must be 32");
-
+    // Without an imatrix, delegate entirely to the reference path.
     if (!quant_weights) {
         quantize_row_q4_hqq_ref(x, y, n_per_row);
         return;
     }
 
-    // weighted quantization not implemented for HQQ
-    quantize_row_q4_hqq_ref(x, y, n_per_row);
+    const int qk = QK4_HQQ;
+    assert(n_per_row % qk == 0);
+    const int nb = n_per_row / qk;
+
+    for (int i = 0; i < nb; i++) {
+
+        // --- Scale initialization: min/max of this block (same as ref path) ---
+        float min = FLT_MAX;
+        float max = -FLT_MAX;
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+
+        float scale = (max - min) ? 15.0f / (max - min) : 0.0f;
+        float zero  = -min * scale;
+
+        // --- HQQ optimization with importance weights from imatrix ---
+        // quant_weights[i*qk .. i*qk+qk-1] are the per-element importance
+        // values for this block.  They are passed directly to the weighted
+        // solver; no pre-processing (e.g. squaring) is applied here because
+        // the imatrix already encodes RMS-activation-based importance.
+        hqq_optimize_zero_imatrix(
+            &x[i * qk],            // this block's weights
+            &quant_weights[i * qk],// per-element importance weights
+            scale,                  // fixed scale
+            &zero,                  // in: RTN zero  out: imatrix-optimized zero
+            qk,                     // group size = QK4_HQQ = 32
+            15,                     // 4-bit: max code = 15
+            HQQ_LP_NORM,            // p = 0.7
+            HQQ_BETA_INIT,          // beta_0 = 10.0
+            HQQ_BETA_KAPPA,         // kappa = 1.01
+            HQQ_ITERS);             // up to 20 iterations
+
+        y[i].scale = GGML_FP32_TO_FP16(scale);
+        y[i].zero  = GGML_FP32_TO_FP16(zero);
+
+        // --- Nibble packing (split-half convention, same as ref path) ---
+        for (int j = 0; j < qk/2; ++j) {
+            const float v0 = x[i*qk + j];
+            const float v1 = x[i*qk + j + qk/2];
+
+            int q0 = (int)roundf(v0 * scale + zero);
+            int q1 = (int)roundf(v1 * scale + zero);
+
+            q0 = MAX(0, MIN(15, q0));
+            q1 = MAX(0, MIN(15, q1));
+
+            // Low nibble = element j, high nibble = element j+qk/2.
+            y[i].qs[j] = (uint8_t)(q0 | (q1 << 4));
+        }
+    }
 }
 
 size_t quantize_q4_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
