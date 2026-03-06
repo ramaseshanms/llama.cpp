@@ -185,7 +185,7 @@ void ggml_vec_dot_q4_1_q8_1_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
-void ggml_vec_dot_q4_hqq_q8_0(
+void ggml_vec_dot_q4_hqq_q8_0_generic(
         int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx,
         const void * GGML_RESTRICT vy, size_t by,
@@ -204,32 +204,30 @@ void ggml_vec_dot_q4_hqq_q8_0(
     const block_q4_hqq * x = (const block_q4_hqq *) vx;
     const block_q8_0  * y = (const block_q8_0  *) vy;
 
-float sumf = 0.0f;
+    float sumf = 0.0f;
 
-for (int ib = 0; ib < nb; ++ib) {
+    for (int ib = 0; ib < nb; ++ib) {
+        const float scale  = GGML_FP16_TO_FP32(x[ib].scale);
+        const float zero   = GGML_FP16_TO_FP32(x[ib].zero);
+        const float factor = GGML_FP16_TO_FP32(y[ib].d) / scale;
 
-    float scale = GGML_FP16_TO_FP32(x[ib].scale);
-    float zero  = GGML_FP16_TO_FP32(x[ib].zero);
-    float yd    = GGML_FP16_TO_FP32(y[ib].d);
+        int sumi_qy = 0;
+        int sumi_y  = 0;
 
-    float block_sum = 0.0f;
+        for (int j = 0; j < 16; ++j) {
+            const int q0 = x[ib].qs[j] & 0xF;
+            const int q1 = x[ib].qs[j] >> 4;
 
-    for (int j = 0; j < 16; ++j) {
+            sumi_qy += q0 * y[ib].qs[j];
+            sumi_qy += q1 * y[ib].qs[j + 16];
+            sumi_y  += y[ib].qs[j];
+            sumi_y  += y[ib].qs[j + 16];
+        }
 
-        int q0 = x[ib].qs[j] & 0xF;
-        int q1 = x[ib].qs[j] >> 4;
-
-        float w0 = (q0 - zero) / scale;
-        float w1 = (q1 - zero) / scale;
-
-        block_sum += w0 * y[ib].qs[j];
-        block_sum += w1 * y[ib].qs[j + 16];
+        sumf += factor * ((float)sumi_qy - zero * (float)sumi_y);
     }
 
-    sumf += block_sum * yd;
-}
-
-*s = sumf;
+    *s = sumf;
 }
 
 void ggml_vec_dot_mxfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {

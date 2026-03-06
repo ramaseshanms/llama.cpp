@@ -430,6 +430,99 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     *s = sumf;
 }
 
+
+// Q4_HQQ x Q8_0 dot product
+// Weight formula: w_j = (q_j - zero) / scale,  q_j in [0,15]
+// Reformulation: (yd/scale) x (sum(q*y) - zero * sum(y))
+// This hoists all per-element FP divisions to a single per-block scalar.
+//
+// NEON lane grouping (vdotq_s32 with qlo then qhi):
+//   dot[k]   = sum_{i=4k}^{4k+3} (q[i]*y[i] + q[i+16]*y[i+16])
+//   sum32[k] = sum_{i=4k}^{4k+3} (y[i] + y[i+16])
+// Both accumulate the same 8 elements per lane -> element-wise subtraction is exact.
+void ggml_vec_dot_q4_hqq_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by,
+        int nrc) {
+    const int nb = n / QK8_0;
+
+    assert(n % QK8_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q4_hqq * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    int ib = 0;
+    float sumf = 0.0f;
+
+#if defined(__ARM_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    const uint8x16_t m4b = vdupq_n_u8(0x0F);
+
+    for (; ib < nb; ++ib) {
+        const float scale  = GGML_CPU_FP16_TO_FP32(x[ib].scale);
+        const float zero   = GGML_CPU_FP16_TO_FP32(x[ib].zero);
+        const float factor = GGML_CPU_FP16_TO_FP32(y[ib].d) / scale;
+
+        // Unpack nibbles
+        const uint8x16_t q4b = vld1q_u8(x[ib].qs);
+        // low nibbles [0..15] and high nibbles [0..15], reinterpreted as int8
+        // (safe: values 0..15 are non-negative, no sign-bit confusion)
+        const int8x16_t qlo = vreinterpretq_s8_u8(vandq_u8(q4b, m4b));
+        const int8x16_t qhi = vreinterpretq_s8_u8(vshrq_n_u8(q4b, 4));
+
+        // Load activations
+        const int8x16_t y_lo = vld1q_s8(y[ib].qs);
+        const int8x16_t y_hi = vld1q_s8(y[ib].qs + 16);
+
+        // sum(q*y): accumulate qlo*y_lo then qhi*y_hi into 4 int32 lanes
+        // Each lane k = sum_{i=4k}^{4k+3}(q[i]*y[i]) + sum_{i=4k}^{4k+3}(q[i+16]*y[i+16])
+        const int32x4_t dot = ggml_vdotq_s32(
+                                  ggml_vdotq_s32(vdupq_n_s32(0), qlo, y_lo),
+                                  qhi, y_hi);
+
+        // sum(y): pairwise-add int8->int16, add lo+hi halves, pairwise->int32
+        // Lane k = sum_{i=4k}^{4k+3}(y[i] + y[i+16])  (same grouping as dot)
+        int16x8_t sum16 = vpaddlq_s8(y_lo);
+        sum16 = vaddq_s16(sum16, vpaddlq_s8(y_hi));
+        const int32x4_t sum32 = vpaddlq_s16(sum16);
+
+        // Convert to float, apply per-block factor
+        const float32x4_t vdot_f  = vcvtq_f32_s32(dot);
+        const float32x4_t vsum_f  = vcvtq_f32_s32(sum32);
+
+        // acc += factor * (sum(q*y) - zero * sum(y))
+        acc = vmlaq_n_f32(acc,
+                          vsubq_f32(vdot_f, vmulq_n_f32(vsum_f, zero)),
+                          factor);
+    }
+
+    sumf = vaddvq_f32(acc);
+#endif
+
+    // scalar tail (handles any remainder and non-NEON builds)
+    for (; ib < nb; ++ib) {
+        const float scale  = GGML_CPU_FP16_TO_FP32(x[ib].scale);
+        const float zero   = GGML_CPU_FP16_TO_FP32(x[ib].zero);
+        const float factor = GGML_CPU_FP16_TO_FP32(y[ib].d) / scale;
+
+        int sumi_qy = 0, sumi_y = 0;
+        for (int j = 0; j < 16; ++j) {
+            const int q0 = x[ib].qs[j] & 0xF;
+            const int q1 = x[ib].qs[j] >> 4;
+            sumi_qy += q0 * y[ib].qs[j] + q1 * y[ib].qs[j + 16];
+            sumi_y  += y[ib].qs[j] + y[ib].qs[j + 16];
+        }
+        sumf += factor * ((float)sumi_qy - zero * (float)sumi_y);
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_1;
     const int nb = n / qk;
