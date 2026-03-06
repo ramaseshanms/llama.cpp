@@ -107,6 +107,226 @@ void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_REST
     }
 }
 
+// =============================================================================
+// HQQ (Half-Quadratic Quantization) solver
+// =============================================================================
+//
+// Reference: "Half-Quadratic Quantization of Large Machine Learning Models"
+//   https://dropbox.github.io/hqq_blog/
+//   https://github.com/mobiusml/hqq
+//
+// Standard RTN (Round-to-Nearest) quantization minimises the L2 error but is
+// sensitive to outliers. HQQ instead minimises a sparsity-promoting Lp loss
+// (p < 1) via Half-Quadratic Splitting — with no calibration data required.
+//
+// Problem formulation (per quantization group):
+//   min_{z}  phi( W - dequant(quant(W, s, z), s, z) )
+// where phi is the Lp norm (p = HQQ_LP_NORM = 0.7).
+//
+// Key property: scale s is FIXED (computed once from min/max).
+// Only the zero-point z is iteratively refined.
+//
+// The optimization alternates between two closed-form sub-problems:
+//   SP1 (shrink):  W_e[j] = shrink_lp( W[j] - dequant(W_q[j]), beta, p )
+//   SP2 (zero):    z      = mean_j( W_q[j] - (W[j] - W_e[j]) * s )
+//   Update:        beta   *= kappa   (tighten penalty each iteration)
+//   Early stop:    if L1 error is no longer decreasing, revert and stop
+//
+// Default hyper-parameters (from the paper):
+//   p     = 0.7    -- Lp exponent; lower => sparser error model
+//   beta  = 10.0   -- initial proximal penalty (NOT 1.0 — common misread)
+//   kappa = 1.01   -- beta growth factor per iteration
+//   iters = 20     -- maximum optimization iterations
+//
+// These macros are shared between the g32 (Q4_HQQ) and g128 (Q4_HQQ_128) paths.
+// =============================================================================
+
+// Lp exponent for the sparsity-promoting loss.
+// p=0.7 models heavy-tailed (hyper-Laplacian) quantization residuals.
+#define HQQ_LP_NORM    0.7f
+
+// Initial proximal penalty beta.
+// Paper default: beta_0 = 1e1 = 10.0.
+// A common misread sets it to 1.0, which gives much weaker shrinkage and
+// noticeably slower convergence in the first several iterations.
+#define HQQ_BETA_INIT  10.0f
+
+// Multiplicative growth factor for beta per iteration.
+// Tightens the proximal constraint, driving the error variable toward 0.
+#define HQQ_BETA_KAPPA 1.01f
+
+// Maximum number of half-quadratic iterations.
+// Early stopping usually triggers well before this limit.
+#define HQQ_ITERS      20
+
+// Maximum quantization group size supported by the stack-allocated working
+// arrays inside hqq_optimize_zero(). Covers g32 (QK4_HQQ=32) and g128.
+#define HQQ_MAX_GROUP  128
+
+// -----------------------------------------------------------------------------
+// hqq_shrink_lp — generalized soft-thresholding operator for Lp norms.
+//
+// Paper formula:
+//   shrink_lp(x, beta, p) = sign(x) * relu( |x| - |x|^(p-1) / beta )
+//
+// Intuition:
+//   p == 1 (L1):  threshold = 1/beta  (classical, constant soft-thresholding).
+//   p <  1:       threshold = |x|^(p-1)/beta; since (p-1)<0, larger |x| gets
+//                 a SMALLER threshold, meaning outliers receive less shrinkage.
+//                 This accurately models the heavy-tailed hyper-Laplacian
+//                 distribution of quantization residuals.
+//
+// @param x     scalar residual: W[j] - dequant(quant(W[j]))
+// @param beta  current proximal penalty parameter (> 0)
+// @param p     Lp exponent (0 < p <= 1)
+// @return      shrinkage-thresholded value, preserving the sign of x
+// -----------------------------------------------------------------------------
+static inline float hqq_shrink_lp(float x, float beta, float p) {
+    const float ax = fabsf(x);
+
+    // Guard against pow(0, negative_exponent) = +inf.
+    if (ax < 1e-8f) {
+        return 0.0f;
+    }
+
+    // threshold = |x|^(p-1) / beta
+    // For p=0.7: exponent = -0.3, so the threshold shrinks as |x| grows.
+    const float threshold = powf(ax, p - 1.0f) / beta;
+    const float shrunk    = ax - threshold;
+
+    // relu + sign restoration
+    return (shrunk > 0.0f) ? (x > 0.0f ? shrunk : -shrunk) : 0.0f;
+}
+
+// -----------------------------------------------------------------------------
+// hqq_optimize_zero — half-quadratic zero-point optimizer (one group).
+//
+// Refines the zero-point z for a single quantization group of n weights.
+// The scale s is kept fixed throughout (the paper shows fixing s and optimising
+// only z keeps the SP2 sub-problem convex and closed-form).
+//
+// Full algorithm (one call per quantization group):
+//
+//   Given: W[0..n-1], s (fixed), z (initial from min/max), max_q (e.g. 15)
+//   For t = 0 .. iters-1:
+//     1. Forward pass — quantize + dequantize with current z:
+//          W_q[j]  = clamp( round(W[j]*s + z), 0, max_q )
+//          W_r[j]  = (W_q[j] - z) / s
+//          err     = sum_j |W[j] - W_r[j]|   (L1, for early stopping)
+//     2. SP1 — error variable via generalized soft-thresholding:
+//          W_e[j]  = shrink_lp( W[j] - W_r[j], beta, p )
+//     3. Early stop:
+//          if err >= best_error:  *z = best_z;  return
+//          else:  best_error = err;  best_z = *z
+//     4. SP2 — update zero-point as mean of de-biased residuals:
+//          z = mean_j( W_q[j] - (W[j] - W_e[j]) * s )
+//        (derivation: argmin_z  sum_j (W_q[j] - (W[j]-W_e[j])*s - z)^2)
+//     5. Beta update: beta *= kappa
+//   On exit: *z = best_z (lowest-L1 zero-point seen across all iterations).
+//
+// @param W      n input weights for this group (read-only)
+// @param s      scale, fixed; must be > 0 (no-op if s == 0)
+// @param z      in/out: initial zero on entry, optimized zero on exit
+// @param n      group size; must be <= HQQ_MAX_GROUP
+// @param max_q  maximum quantized code (e.g. 15 for 4-bit)
+// @param p      Lp exponent       (HQQ_LP_NORM = 0.7)
+// @param beta   initial penalty   (HQQ_BETA_INIT = 10.0)
+// @param kappa  beta growth rate  (HQQ_BETA_KAPPA = 1.01)
+// @param iters  max iterations    (HQQ_ITERS = 20)
+// -----------------------------------------------------------------------------
+static void hqq_optimize_zero(
+    const float * GGML_RESTRICT W,
+    float   s,
+    float * z,
+    int     n,
+    int     max_q,
+    float   p,
+    float   beta,
+    float   kappa,
+    int     iters)
+{
+    // Stack-allocated working arrays.
+    // n <= HQQ_MAX_GROUP = 128  =>  2 * 128 * 4 = 1 KiB — safe for the stack.
+    float W_q[HQQ_MAX_GROUP]; // quantized codes cast to float for arithmetic
+    float W_e[HQQ_MAX_GROUP]; // SP1 error variable (shrinkage output)
+
+    // Constant-value group: scale is 0, nothing to optimise.
+    if (s == 0.0f) {
+        return;
+    }
+
+    float best_z     = *z;
+    float best_error = FLT_MAX;
+
+    for (int t = 0; t < iters; t++) {
+        float error = 0.0f;
+
+        // -------------------------------------------------------------------
+        // Steps 1 + 2: forward pass and SP1 shrinkage in a single loop.
+        // W_r is computed inline (not stored) to avoid a third working array.
+        // -------------------------------------------------------------------
+        for (int j = 0; j < n; j++) {
+            // Step 1: quantize with the CURRENT z then immediately dequantize.
+            int q_int = (int)roundf(W[j] * s + *z);
+            q_int = (q_int < 0) ? 0 : (q_int > max_q ? max_q : q_int);
+            W_q[j] = (float)q_int;
+
+            // Reconstruction: W_r = (W_q[j] - z) / s
+            const float W_r   = (W_q[j] - *z) / s;
+            const float resid = W[j] - W_r;
+
+            // L1 error for early stopping (computed before SP2 updates z)
+            error += fabsf(resid);
+
+            // Step 2 (SP1): generalized soft-thresholding of the residual.
+            // W_e[j] captures the "outlier" component of the error; the
+            // remaining (W[j] - W_e[j]) is the de-noised weight used in SP2.
+            W_e[j] = hqq_shrink_lp(resid, beta, p);
+        }
+
+        // -------------------------------------------------------------------
+        // Step 3: early stopping on L1 error.
+        // The error is measured under the CURRENT z (before the SP2 update),
+        // so best_z always corresponds to the z that produced best_error.
+        // -------------------------------------------------------------------
+        if (error < best_error) {
+            best_error = error;
+            best_z     = *z;
+        } else {
+            // No improvement: revert and stop.
+            *z = best_z;
+            return;
+        }
+
+        // -------------------------------------------------------------------
+        // Step 4 (SP2): closed-form zero-point update.
+        // z = mean_j( W_q[j] - (W[j] - W_e[j]) * s )
+        // The term (W[j] - W_e[j]) is the "outlier-stripped" weight; the
+        // formula asks: "what z makes W_q[j] ≈ (W[j]-W_e[j])*s + z on average?"
+        // -------------------------------------------------------------------
+        float sum_z = 0.0f;
+        for (int j = 0; j < n; j++) {
+            sum_z += W_q[j] - (W[j] - W_e[j]) * s;
+        }
+        *z = sum_z / (float)n;
+
+        // -------------------------------------------------------------------
+        // Step 5: tighten the proximal penalty.
+        // Larger beta => smaller shrinkage threshold => SP2's z update
+        // converges toward the plain RTN mean as the loop progresses.
+        // -------------------------------------------------------------------
+        beta *= kappa;
+    }
+
+    // Loop finished all iterations without triggering early stop.
+    // Return the best zero-point found.
+    *z = best_z;
+}
+
+// =============================================================================
+// End of HQQ solver helpers
+// =============================================================================
+
 void quantize_row_q4_hqq_ref(const float * GGML_RESTRICT x,
                              block_q4_hqq * GGML_RESTRICT y,
                              int64_t k) {
@@ -128,29 +348,53 @@ void quantize_row_q4_hqq_ref(const float * GGML_RESTRICT x,
             if (v > max) max = v;
         }
 
+        // Initial scale and zero-point from min/max range (standard RTN init).
+        // scale = 15 / (max - min)  maps [min, max] -> [0, 15].
+        // zero  = -min * scale      maps  min        ->  0.
         float scale = (max - min) ? 15.0f / (max - min) : 0.0f;
         float zero  = -min * scale;
+
+        // -----------------------------------------------------------------
+        // HQQ optimization: refine zero-point via half-quadratic splitting.
+        // Scale is kept fixed (as per the paper); only z is updated.
+        //
+        // After this call, `zero` holds the optimized zero-point that
+        // minimises the Lp (p=0.7) quantization error for this block,
+        // with the best early-stopping checkpoint applied automatically.
+        // -----------------------------------------------------------------
+        hqq_optimize_zero(
+            &x[i * qk],   // this block's weights
+            scale,         // fixed scale
+            &zero,         // in: RTN zero  out: HQQ-optimized zero
+            qk,            // group size = QK4_HQQ = 32
+            15,            // 4-bit: max quantized code = 15
+            HQQ_LP_NORM,   // p = 0.7
+            HQQ_BETA_INIT, // beta_0 = 10.0  (paper default)
+            HQQ_BETA_KAPPA,// kappa = 1.01
+            HQQ_ITERS);    // up to 20 iterations
 
         y[i].scale = GGML_FP32_TO_FP16(scale);
         y[i].zero  = GGML_FP32_TO_FP16(zero);
 
         // Split-half packing: qs[j] low nibble = element j,
-        //                     qs[j] high nibble = element j + qk/2
-        // This matches the vec_dot convention used by all SIMD kernels
-        // (bytes_from_nibbles_32 expands low nibbles to first 16 lanes,
-        //  high nibbles to last 16 lanes, aligned with sequential Q8_0).
+        //                     qs[j] high nibble = element j + qk/2.
+        // This matches the vec_dot convention used by all SIMD kernels:
+        // bytes_from_nibbles_32() expands low nibbles to lanes 0-15 and
+        // high nibbles to lanes 16-31, aligned with sequential Q8_0 layout.
         for (int j = 0; j < qk/2; ++j) {
 
-            const float v0 = x[i*qk + j];          // element j        (0..15)
-            const float v1 = x[i*qk + j + qk/2];   // element j+qk/2  (16..31)
+            const float v0 = x[i*qk + j];          // element j       (0..15)
+            const float v1 = x[i*qk + j + qk/2];   // element j+qk/2 (16..31)
 
+            // Quantize each element using the optimized (scale, zero).
             int q0 = (int) roundf(v0 * scale + zero);
             int q1 = (int) roundf(v1 * scale + zero);
 
             q0 = MAX(0, MIN(15, q0));
             q1 = MAX(0, MIN(15, q1));
 
-            y[i].qs[j] = q0 | (q1 << 4);
+            // Pack: low nibble = element j, high nibble = element j+qk/2.
+            y[i].qs[j] = (uint8_t)(q0 | (q1 << 4));
         }
     }
 }
