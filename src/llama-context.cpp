@@ -2837,7 +2837,32 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
+    // Q4_HQQ KV-cache quality note: the HQQ affine zero-point accumulates a
+    // DC bias across attention heads that causes coherence degradation on
+    // symmetric activation distributions (e.g. Llama-3).  Warn the user so
+    // they can make an informed choice; do not hard-block.
+    if (params.type_k == GGML_TYPE_Q4_HQQ || params.type_k == GGML_TYPE_Q4_HQQ_128) {
+        LLAMA_LOG_WARN("%s: K cache type %s uses HQQ affine quantization — "
+                       "output quality may degrade on models with symmetric "
+                       "activation distributions (e.g. Llama-3). "
+                       "Prefer Q4_0 or Q8_0 for production use.\n",
+                       __func__, ggml_type_name(params.type_k));
+    }
+    if (params.type_v == GGML_TYPE_Q4_HQQ || params.type_v == GGML_TYPE_Q4_HQQ_128) {
+        LLAMA_LOG_WARN("%s: V cache type %s uses HQQ affine quantization — "
+                       "output quality may degrade on models with symmetric "
+                       "activation distributions (e.g. Llama-3). "
+                       "V cache quantization also requires Flash Attention (-fa).\n",
+                       __func__, ggml_type_name(params.type_v));
+    }
+
+    // Block-size alignment check: a quantised K/V tensor must have its head
+    // dimension evenly divisible by the quantisation block size.  This check
+    // was previously gated on LLAMA_FLASH_ATTN_TYPE_AUTO only, so it was
+    // silently skipped when the user explicitly enabled Flash Attention with
+    // -fa (LLAMA_FLASH_ATTN_TYPE_ENABLED).  Guard against both AUTO and
+    // ENABLED to catch misalignment regardless of how FA was requested.
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         if (model->hparams.n_embd_head_k % blck_size != 0) {
             LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
@@ -2846,10 +2871,12 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_v)) {
+    // Fix: the original error message incorrectly printed n_embd_head_k for
+    // the V cache path.  Corrected to n_embd_head_v.
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
         if (model->hparams.n_embd_head_v % blck_size != 0) {
-            LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_k=%u\n",
+            LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
                 __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v);
             return nullptr;
         }
