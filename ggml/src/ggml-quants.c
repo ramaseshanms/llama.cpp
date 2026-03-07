@@ -477,7 +477,14 @@ void quantize_row_q4_hqq_ref(const float * GGML_RESTRICT x,
             HQQ_ITERS);    // up to 20 iterations
 
         y[i].scale = GGML_FP32_TO_FP16(scale);
-        y[i].zero  = GGML_FP32_TO_FP16(zero);
+        // Phase 3: zero stored as uint8 (was FP16).
+        // The HQQ-optimized zero is in [0,15] for 4-bit (z = -min*scale,
+        // scale=15/(max-min), so z in [0,15]).  We round to the nearest
+        // integer and clamp to [0,255] for safe uint8 storage.
+        // Using integer zero removes the FP16 rounding error in the stored
+        // zero-point and saves 1 byte per block vs the FP16 encoding.
+        y[i].zero  = (uint8_t)MAX(0, MIN(255, (int)roundf(zero)));
+        y[i]._pad  = 0; // padding byte always zero for reproducibility
 
         // Split-half packing: qs[j] low nibble = element j,
         //                     qs[j] high nibble = element j + qk/2.
@@ -747,7 +754,9 @@ void dequantize_row_q4_hqq(const block_q4_hqq * x, float * y, int64_t k) {
     for (int i = 0; i < nb; i++) {
 
         const float scale = GGML_FP16_TO_FP32(x[i].scale);
-        const float zero  = GGML_FP16_TO_FP32(x[i].zero);
+        // Phase 3: zero is now stored as uint8; cast directly to float.
+        // No FP16 rounding error; the integer zero is exact.
+        const float zero  = (float)x[i].zero;
 
         // Split-half packing: qs[j] low nibble = element j,
         //                     qs[j] high nibble = element j + QK4_HQQ/2.
@@ -771,7 +780,8 @@ void dequantize_row_q4_hqq_128(const block_q4_hqq_128 * x, float * y, int64_t k)
     for (int i = 0; i < nb; i++) {
 
         const float scale = GGML_FP16_TO_FP32(x[i].scale);
-        const float zero  = GGML_FP16_TO_FP32(x[i].zero);
+        // Phase 3: zero stored as uint8 — exact integer, no FP16 rounding.
+        const float zero  = (float)x[i].zero;
 
         // Split-half packing (same convention as g32):
         //   qs[j] low nibble  = element j
@@ -2466,7 +2476,8 @@ static void quantize_row_q4_hqq_impl(const float * GGML_RESTRICT x,
             HQQ_ITERS);             // up to 20 iterations
 
         y[i].scale = GGML_FP32_TO_FP16(scale);
-        y[i].zero  = GGML_FP32_TO_FP16(zero);
+        y[i].zero  = (uint8_t)MAX(0, MIN(255, (int)roundf(zero))); // Phase 3: INT8 zero
+        y[i]._pad  = 0;
 
         // --- Nibble packing (split-half convention, same as ref path) ---
         for (int j = 0; j < qk/2; ++j) {
@@ -2594,7 +2605,8 @@ void quantize_row_q4_hqq_128_ref(const float * GGML_RESTRICT x,
             HQQ_ITERS);     // up to 20 iterations
 
         y[i].scale = GGML_FP32_TO_FP16(scale);
-        y[i].zero  = GGML_FP32_TO_FP16(zero);
+        y[i].zero  = (uint8_t)MAX(0, MIN(255, (int)roundf(zero))); // Phase 3: INT8 zero
+        y[i]._pad  = 0;
 
         // Split-half nibble packing over 128 weights:
         //   qs[j] low nibble  = element j          (j in 0..63)
@@ -2665,7 +2677,8 @@ static void quantize_row_q4_hqq_128_impl(const float * GGML_RESTRICT x,
             HQQ_ITERS);
 
         y[i].scale = GGML_FP32_TO_FP16(scale);
-        y[i].zero  = GGML_FP32_TO_FP16(zero);
+        y[i].zero  = (uint8_t)MAX(0, MIN(255, (int)roundf(zero))); // Phase 3: INT8 zero
+        y[i]._pad  = 0;
 
         for (int j = 0; j < qk/2; ++j) {
             const float v0 = x[i*qk + j];

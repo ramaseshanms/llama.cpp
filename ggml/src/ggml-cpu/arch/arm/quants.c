@@ -465,7 +465,7 @@ void ggml_vec_dot_q4_hqq_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
 
     for (; ib < nb; ++ib) {
         const float scale  = GGML_CPU_FP16_TO_FP32(x[ib].scale);
-        const float zero   = GGML_CPU_FP16_TO_FP32(x[ib].zero);
+        const float zero   = (float)x[ib].zero /* INT8 zero (Phase 3) */;
         const float factor = GGML_CPU_FP16_TO_FP32(y[ib].d) / scale;
 
         // Unpack nibbles
@@ -507,7 +507,7 @@ void ggml_vec_dot_q4_hqq_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     // scalar tail (handles any remainder and non-NEON builds)
     for (; ib < nb; ++ib) {
         const float scale  = GGML_CPU_FP16_TO_FP32(x[ib].scale);
-        const float zero   = GGML_CPU_FP16_TO_FP32(x[ib].zero);
+        const float zero   = (float)x[ib].zero /* INT8 zero (Phase 3) */;
         const float factor = GGML_CPU_FP16_TO_FP32(y[ib].d) / scale;
 
         int sumi_qy = 0, sumi_y = 0;
@@ -554,7 +554,7 @@ void ggml_vec_dot_q4_hqq_128_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
 
     for (; ib < nb128; ++ib) {
         const float scale   = GGML_CPU_FP16_TO_FP32(x[ib].scale);
-        const float zero    = GGML_CPU_FP16_TO_FP32(x[ib].zero);
+        const float zero    = (float)x[ib].zero /* INT8 zero (Phase 3) */;
         const int   iy_base = ib * (QK4_HQQ_128 / QK8_0);
 
         // Process 4 Q8_0 sub-blocks (32 elements each).
@@ -597,7 +597,7 @@ void ggml_vec_dot_q4_hqq_128_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     // Scalar tail (non-NEON or remainder).
     for (; ib < nb128; ++ib) {
         const float scale   = GGML_CPU_FP16_TO_FP32(x[ib].scale);
-        const float zero    = GGML_CPU_FP16_TO_FP32(x[ib].zero);
+        const float zero    = (float)x[ib].zero /* INT8 zero (Phase 3) */;
         const int   iy_base = ib * (QK4_HQQ_128 / QK8_0);
 
         for (int sub = 0; sub < QK4_HQQ_128 / QK8_0; ++sub) {

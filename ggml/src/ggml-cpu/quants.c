@@ -208,7 +208,7 @@ void ggml_vec_dot_q4_hqq_q8_0_generic(
 
     for (int ib = 0; ib < nb; ++ib) {
         const float scale  = GGML_FP16_TO_FP32(x[ib].scale);
-        const float zero   = GGML_FP16_TO_FP32(x[ib].zero);
+        const float zero   = (float)x[ib].zero /* INT8 zero (Phase 3) */;
         const float factor = GGML_FP16_TO_FP32(y[ib].d) / scale;
 
         int sumi_qy = 0;
@@ -270,7 +270,7 @@ void ggml_vec_dot_q4_hqq_128_q8_0_generic(
     // spans 4 consecutive Q8_0 activation blocks (4 * 32 = 128 elements).
     for (int ib = 0; ib < nb128; ++ib) {
         const float scale = GGML_FP16_TO_FP32(x[ib].scale);
-        const float zero  = GGML_FP16_TO_FP32(x[ib].zero);
+        const float zero  = (float)x[ib].zero /* INT8 zero (Phase 3) */;
         // pre-compute the shared scalar; yd varies per Q8_0 sub-block below
         // full formula per sub-block: (y[iy].d / scale) * (sumi_qy - zero*sumi_y)
 
@@ -326,7 +326,7 @@ void ggml_vec_dot_q4_hqq_128_q8_0_generic(
         const block_q8_0   * yt = y + nb128 * (QK4_HQQ_128 / QK8_0);
         for (int ib = 0; ib < tail_nb; ++ib) {
             const float scale  = GGML_FP16_TO_FP32(xt[ib].scale);
-            const float zero   = GGML_FP16_TO_FP32(xt[ib].zero);
+            const float zero   = (float)xt[ib].zero /* INT8 zero (Phase 3) */;
             const float factor = GGML_FP16_TO_FP32(yt[ib].d) / scale;
             int sumi_qy = 0, sumi_y = 0;
             for (int j = 0; j < 16; ++j) {
