@@ -476,14 +476,15 @@ void quantize_row_q4_hqq_ref(const float * GGML_RESTRICT x,
             HQQ_BETA_KAPPA,// kappa = 1.01
             HQQ_ITERS);    // up to 20 iterations
 
+        // Phase 3: zero stored as uint8.
+        // IMPORTANT: round to integer BEFORE packing so that the quantized
+        // codes are computed with the same integer zero that dequantization
+        // will read back from storage.  Using the raw float zero here while
+        // storing the rounded integer would cause a systematic offset between
+        // pack and unpack paths.
+        const float zero_f = (float)MAX(0, MIN(255, (int)roundf(zero)));
         y[i].scale = GGML_FP32_TO_FP16(scale);
-        // Phase 3: zero stored as uint8 (was FP16).
-        // The HQQ-optimized zero is in [0,15] for 4-bit (z = -min*scale,
-        // scale=15/(max-min), so z in [0,15]).  We round to the nearest
-        // integer and clamp to [0,255] for safe uint8 storage.
-        // Using integer zero removes the FP16 rounding error in the stored
-        // zero-point and saves 1 byte per block vs the FP16 encoding.
-        y[i].zero  = (uint8_t)MAX(0, MIN(255, (int)roundf(zero)));
+        y[i].zero  = (uint8_t)zero_f;
         y[i]._pad  = 0; // padding byte always zero for reproducibility
 
         // Split-half packing: qs[j] low nibble = element j,
@@ -496,9 +497,9 @@ void quantize_row_q4_hqq_ref(const float * GGML_RESTRICT x,
             const float v0 = x[i*qk + j];          // element j       (0..15)
             const float v1 = x[i*qk + j + qk/2];   // element j+qk/2 (16..31)
 
-            // Quantize each element using the optimized (scale, zero).
-            int q0 = (int) roundf(v0 * scale + zero);
-            int q1 = (int) roundf(v1 * scale + zero);
+            // Quantize using the integer-rounded zero (same as stored/dequant).
+            int q0 = (int) roundf(v0 * scale + zero_f);
+            int q1 = (int) roundf(v1 * scale + zero_f);
 
             q0 = MAX(0, MIN(15, q0));
             q1 = MAX(0, MIN(15, q1));
@@ -2475,8 +2476,10 @@ static void quantize_row_q4_hqq_impl(const float * GGML_RESTRICT x,
             HQQ_BETA_KAPPA,         // kappa = 1.01
             HQQ_ITERS);             // up to 20 iterations
 
+        // Round zero to integer before packing (must match stored/dequant value).
+        const float zero_f = (float)MAX(0, MIN(255, (int)roundf(zero)));
         y[i].scale = GGML_FP32_TO_FP16(scale);
-        y[i].zero  = (uint8_t)MAX(0, MIN(255, (int)roundf(zero))); // Phase 3: INT8 zero
+        y[i].zero  = (uint8_t)zero_f; // Phase 3: INT8 zero
         y[i]._pad  = 0;
 
         // --- Nibble packing (split-half convention, same as ref path) ---
@@ -2484,8 +2487,9 @@ static void quantize_row_q4_hqq_impl(const float * GGML_RESTRICT x,
             const float v0 = x[i*qk + j];
             const float v1 = x[i*qk + j + qk/2];
 
-            int q0 = (int)roundf(v0 * scale + zero);
-            int q1 = (int)roundf(v1 * scale + zero);
+            // Use integer zero_f (same as stored) to keep pack/unpack consistent.
+            int q0 = (int)roundf(v0 * scale + zero_f);
+            int q1 = (int)roundf(v1 * scale + zero_f);
 
             q0 = MAX(0, MIN(15, q0));
             q1 = MAX(0, MIN(15, q1));
@@ -2604,8 +2608,10 @@ void quantize_row_q4_hqq_128_ref(const float * GGML_RESTRICT x,
             HQQ_BETA_KAPPA, // kappa = 1.01
             HQQ_ITERS);     // up to 20 iterations
 
+        // Round zero to integer before packing (must match stored/dequant value).
+        const float zero_f = (float)MAX(0, MIN(255, (int)roundf(zero)));
         y[i].scale = GGML_FP32_TO_FP16(scale);
-        y[i].zero  = (uint8_t)MAX(0, MIN(255, (int)roundf(zero))); // Phase 3: INT8 zero
+        y[i].zero  = (uint8_t)zero_f; // Phase 3: INT8 zero
         y[i]._pad  = 0;
 
         // Split-half nibble packing over 128 weights:
@@ -2615,8 +2621,9 @@ void quantize_row_q4_hqq_128_ref(const float * GGML_RESTRICT x,
             const float v0 = x[i*qk + j];
             const float v1 = x[i*qk + j + qk/2];
 
-            int q0 = (int)roundf(v0 * scale + zero);
-            int q1 = (int)roundf(v1 * scale + zero);
+            // Use integer zero_f (same as stored) to keep pack/unpack consistent.
+            int q0 = (int)roundf(v0 * scale + zero_f);
+            int q1 = (int)roundf(v1 * scale + zero_f);
 
             q0 = MAX(0, MIN(15, q0));
             q1 = MAX(0, MIN(15, q1));
@@ -2676,16 +2683,19 @@ static void quantize_row_q4_hqq_128_impl(const float * GGML_RESTRICT x,
             HQQ_BETA_KAPPA,
             HQQ_ITERS);
 
+        // Round zero to integer before packing (must match stored/dequant value).
+        const float zero_f = (float)MAX(0, MIN(255, (int)roundf(zero)));
         y[i].scale = GGML_FP32_TO_FP16(scale);
-        y[i].zero  = (uint8_t)MAX(0, MIN(255, (int)roundf(zero))); // Phase 3: INT8 zero
+        y[i].zero  = (uint8_t)zero_f; // Phase 3: INT8 zero
         y[i]._pad  = 0;
 
         for (int j = 0; j < qk/2; ++j) {
             const float v0 = x[i*qk + j];
             const float v1 = x[i*qk + j + qk/2];
 
-            int q0 = MAX(0, MIN(15, (int)roundf(v0 * scale + zero)));
-            int q1 = MAX(0, MIN(15, (int)roundf(v1 * scale + zero)));
+            // Use integer zero_f (same as stored) to keep pack/unpack consistent.
+            int q0 = MAX(0, MIN(15, (int)roundf(v0 * scale + zero_f)));
+            int q1 = MAX(0, MIN(15, (int)roundf(v1 * scale + zero_f)));
 
             y[i].qs[j] = (uint8_t)(q0 | (q1 << 4));
         }
