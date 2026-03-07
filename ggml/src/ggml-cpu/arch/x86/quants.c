@@ -782,6 +782,103 @@ void ggml_vec_dot_q4_hqq_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sumf;
 }
 
+// ggml_vec_dot_q4_hqq_128_q8_0 — AVX2-accelerated dot product for g128.
+//
+// The Q4_HQQ_128 weight block contains 128 4-bit weights packed in 64 bytes
+// with split-half layout (same as g32).  128 activations span 4 consecutive
+// Q8_0 blocks, each with its own FP16 scale y[iy].d.
+//
+// Strategy: for each g128 weight block, iterate over 4 sub-blocks of 32
+// elements.  Within each sub-block the AVX2 kernel is identical to the g32
+// path — load 16 nibble bytes, unpack to 32 uint8, compute maddubs + madd.
+// The per-sub-block factor = y[iy].d / scale is a scalar FP32.
+void ggml_vec_dot_q4_hqq_128_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by,
+        int nrc) {
+    assert(n % QK4_HQQ_128 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const int nb128 = n / QK4_HQQ_128;
+
+    const block_q4_hqq_128 * GGML_RESTRICT x = vx;
+    const block_q8_0        * GGML_RESTRICT y = vy;
+
+    int ib = 0;
+    float sumf = 0.0f;
+
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    const __m256i ones16 = _mm256_set1_epi16(1);
+
+    for (; ib < nb128; ++ib) {
+        const float scale  = GGML_CPU_FP16_TO_FP32(x[ib].scale);
+        const float zero   = GGML_CPU_FP16_TO_FP32(x[ib].zero);
+        const int   iy_base = ib * (QK4_HQQ_128 / QK8_0);
+
+        // Process 4 Q8_0 sub-blocks (4 * 32 = 128 elements per weight block).
+        for (int sub = 0; sub < QK4_HQQ_128 / QK8_0; ++sub) {
+            const int   qs_off = sub * (QK8_0 / 2);     // nibble-byte offset in qs[]
+            const int   iy     = iy_base + sub;
+            const float factor = GGML_CPU_FP16_TO_FP32(y[iy].d) / scale;
+
+            // Unpack 16 nibble bytes -> 32 uint8 values in [0,15].
+            // bytes_from_nibbles_32 reads 16 bytes; qs_off selects the sub-block.
+            const __m256i qx   = bytes_from_nibbles_32(x[ib].qs + qs_off);
+            const __m256i qy   = _mm256_loadu_si256((const __m256i *)y[iy].qs);
+
+            // sum(q*y): maddubs (uint8 * int8 -> int16) then madd -> int32 -> float
+            const __m256i dot16 = _mm256_maddubs_epi16(qx, qy);
+            const __m256 vdot   = _mm256_cvtepi32_ps(_mm256_madd_epi16(dot16, ones16));
+
+            // sum(y): sign-extend int8->int16, add lo+hi halves, madd -> int32 -> float
+            const __m128i qy_lo = _mm256_castsi256_si128(qy);
+            const __m128i qy_hi = _mm256_extracti128_si256(qy, 1);
+            const __m256i qy_s16_sum = _mm256_add_epi16(
+                _mm256_cvtepi8_epi16(qy_lo),
+                _mm256_cvtepi8_epi16(qy_hi));
+            const __m256 vsum_y = _mm256_cvtepi32_ps(_mm256_madd_epi16(qy_s16_sum, ones16));
+
+            // acc += factor * (sum(q*y) - zero * sum(y))
+            const __m256 vfactor = _mm256_set1_ps(factor);
+            const __m256 vzero   = _mm256_set1_ps(zero);
+            acc = _mm256_fmadd_ps(vfactor,
+                                  _mm256_sub_ps(vdot, _mm256_mul_ps(vzero, vsum_y)),
+                                  acc);
+        }
+    }
+
+    sumf = hsum_float_8(acc);
+#endif
+
+    // Scalar tail for non-AVX2 or remainder blocks.
+    for (; ib < nb128; ++ib) {
+        const float scale   = GGML_CPU_FP16_TO_FP32(x[ib].scale);
+        const float zero    = GGML_CPU_FP16_TO_FP32(x[ib].zero);
+        const int   iy_base = ib * (QK4_HQQ_128 / QK8_0);
+
+        for (int sub = 0; sub < QK4_HQQ_128 / QK8_0; ++sub) {
+            const int   qs_off = sub * (QK8_0 / 2);
+            const int   iy     = iy_base + sub;
+            const float factor = GGML_CPU_FP16_TO_FP32(y[iy].d) / scale;
+            int sumi_qy = 0, sumi_y = 0;
+            for (int j = 0; j < QK8_0/2; ++j) {
+                const int q0 = x[ib].qs[qs_off + j] & 0xF;
+                const int q1 = x[ib].qs[qs_off + j] >> 4;
+                sumi_qy += q0 * (int)y[iy].qs[j] + q1 * (int)y[iy].qs[j + QK8_0/2];
+                sumi_y  += (int)y[iy].qs[j] + (int)y[iy].qs[j + QK8_0/2];
+            }
+            sumf += factor * ((float)sumi_qy - zero * (float)sumi_y);
+        }
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_1;
     const int nb = n / qk;

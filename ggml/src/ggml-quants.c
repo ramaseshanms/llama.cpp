@@ -750,14 +750,38 @@ void dequantize_row_q4_hqq(const block_q4_hqq * x, float * y, int64_t k) {
         const float zero  = GGML_FP16_TO_FP32(x[i].zero);
 
         // Split-half packing: qs[j] low nibble = element j,
-        //                     qs[j] high nibble = element j + QK4_HQQ/2
+        //                     qs[j] high nibble = element j + QK4_HQQ/2.
+        // Reconstruction: w = (q - zero) / scale
         for (int j = 0; j < QK4_HQQ/2; ++j) {
-
             const int x0 = (x[i].qs[j] & 0x0F);   // element j
             const int x1 = (x[i].qs[j] >>    4);   // element j + QK4_HQQ/2
 
             y[i*QK4_HQQ + j]              = (x0 - zero) / scale;
             y[i*QK4_HQQ + j + QK4_HQQ/2] = (x1 - zero) / scale;
+        }
+    }
+}
+
+// dequantize_row_q4_hqq_128 — g128 variant.
+// Identical formula to the g32 variant; only the block struct and QK differ.
+void dequantize_row_q4_hqq_128(const block_q4_hqq_128 * x, float * y, int64_t k) {
+
+    const int nb = k / QK4_HQQ_128;
+
+    for (int i = 0; i < nb; i++) {
+
+        const float scale = GGML_FP16_TO_FP32(x[i].scale);
+        const float zero  = GGML_FP16_TO_FP32(x[i].zero);
+
+        // Split-half packing (same convention as g32):
+        //   qs[j] low nibble  = element j
+        //   qs[j] high nibble = element j + QK4_HQQ_128/2
+        for (int j = 0; j < QK4_HQQ_128/2; ++j) {
+            const int x0 = (x[i].qs[j] & 0x0F);
+            const int x1 = (x[i].qs[j] >>    4);
+
+            y[i*QK4_HQQ_128 + j]                  = (x0 - zero) / scale;
+            y[i*QK4_HQQ_128 + j + QK4_HQQ_128/2]  = (x1 - zero) / scale;
         }
     }
 }
@@ -2488,6 +2512,10 @@ void quantize_row_q4_hqq(
     );
 }
 
+// quantize_q4_hqq — multi-row entry point for the g32 variant.
+// When quant_weights is NULL the fast ref path is taken (plain HQQ, no imatrix).
+// When quant_weights is non-NULL each row is processed through
+// quantize_row_q4_hqq_impl() which applies importance-weighted HQQ.
 size_t quantize_q4_hqq(const float * GGML_RESTRICT src,
                        void * GGML_RESTRICT dst,
                        int64_t nrow,
@@ -2510,6 +2538,174 @@ size_t quantize_q4_hqq(const float * GGML_RESTRICT src,
 
     return nrow * row_size;
 }
+
+// =============================================================================
+// Q4_HQQ_128 (g128) — quantizer and dequantizer implementations
+// =============================================================================
+//
+// Group size 128 is the paper's default ("_g128" notation in benchmarks).
+// Compared to g32, the 4-byte scale+zero overhead is amortised over 4x more
+// weights: 0.25 bpw overhead vs 0.5 bpw, giving 4.25 bpw total.
+//
+// The HQQ proximal solver (hqq_optimize_zero / hqq_optimize_zero_imatrix)
+// is called identically — just with n=128 and a pointer to block_q4_hqq_128.
+// =============================================================================
+
+// quantize_row_q4_hqq_128_ref — reference HQQ quantizer for g128.
+// Called from the ggml type table (.from_float_ref) and from the multi-row
+// entry point when no imatrix is available.
+void quantize_row_q4_hqq_128_ref(const float * GGML_RESTRICT x,
+                                  block_q4_hqq_128 * GGML_RESTRICT y,
+                                  int64_t k) {
+
+    const int qk = QK4_HQQ_128;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+
+        // Min/max scan over the 128-weight group.
+        float min = FLT_MAX;
+        float max = -FLT_MAX;
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+
+        // Initial scale and zero from min/max (RTN initialization).
+        float scale = (max - min) ? 15.0f / (max - min) : 0.0f;
+        float zero  = -min * scale;
+
+        // HQQ optimization: refine zero over the 128-weight group.
+        // The HQQ_MAX_GROUP = 128 constant ensures the helper's stack arrays
+        // are large enough; no heap allocation is needed.
+        hqq_optimize_zero(
+            &x[i * qk],    // this block's 128 weights
+            scale,          // fixed scale
+            &zero,          // in: RTN zero  out: HQQ-optimized zero
+            qk,             // group size = 128
+            15,             // 4-bit: max code = 15
+            HQQ_LP_NORM,    // p = 0.7
+            HQQ_BETA_INIT,  // beta_0 = 10.0
+            HQQ_BETA_KAPPA, // kappa = 1.01
+            HQQ_ITERS);     // up to 20 iterations
+
+        y[i].scale = GGML_FP32_TO_FP16(scale);
+        y[i].zero  = GGML_FP32_TO_FP16(zero);
+
+        // Split-half nibble packing over 128 weights:
+        //   qs[j] low nibble  = element j          (j in 0..63)
+        //   qs[j] high nibble = element j + qk/2   (j+64 in 64..127)
+        for (int j = 0; j < qk/2; ++j) {
+            const float v0 = x[i*qk + j];
+            const float v1 = x[i*qk + j + qk/2];
+
+            int q0 = (int)roundf(v0 * scale + zero);
+            int q1 = (int)roundf(v1 * scale + zero);
+
+            q0 = MAX(0, MIN(15, q0));
+            q1 = MAX(0, MIN(15, q1));
+
+            y[i].qs[j] = (uint8_t)(q0 | (q1 << 4));
+        }
+    }
+}
+
+// quantize_row_q4_hqq_128 — void-pointer wrapper for the g128 quantizer.
+// Used by the ggml CPU type table .from_float callback.
+void quantize_row_q4_hqq_128(const float * GGML_RESTRICT x,
+                              void * GGML_RESTRICT y,
+                              int64_t k) {
+    quantize_row_q4_hqq_128_ref(x, (block_q4_hqq_128 *)y, k);
+}
+
+// quantize_row_q4_hqq_128_impl — imatrix-aware g128 quantizer (one row).
+// Mirrors quantize_row_q4_hqq_impl() but uses QK4_HQQ_128 = 128.
+static void quantize_row_q4_hqq_128_impl(const float * GGML_RESTRICT x,
+                                          block_q4_hqq_128 * GGML_RESTRICT y,
+                                          int64_t n_per_row,
+                                          const float * quant_weights) {
+
+    if (!quant_weights) {
+        quantize_row_q4_hqq_128_ref(x, y, n_per_row);
+        return;
+    }
+
+    const int qk = QK4_HQQ_128;
+    assert(n_per_row % qk == 0);
+    const int nb = n_per_row / qk;
+
+    for (int i = 0; i < nb; i++) {
+
+        float min = FLT_MAX;
+        float max = -FLT_MAX;
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+
+        float scale = (max - min) ? 15.0f / (max - min) : 0.0f;
+        float zero  = -min * scale;
+
+        // Run HQQ with importance weights from imatrix over 128 weights.
+        hqq_optimize_zero_imatrix(
+            &x[i * qk],
+            &quant_weights[i * qk],
+            scale,
+            &zero,
+            qk,             // group size = 128
+            15,
+            HQQ_LP_NORM,
+            HQQ_BETA_INIT,
+            HQQ_BETA_KAPPA,
+            HQQ_ITERS);
+
+        y[i].scale = GGML_FP32_TO_FP16(scale);
+        y[i].zero  = GGML_FP32_TO_FP16(zero);
+
+        for (int j = 0; j < qk/2; ++j) {
+            const float v0 = x[i*qk + j];
+            const float v1 = x[i*qk + j + qk/2];
+
+            int q0 = MAX(0, MIN(15, (int)roundf(v0 * scale + zero)));
+            int q1 = MAX(0, MIN(15, (int)roundf(v1 * scale + zero)));
+
+            y[i].qs[j] = (uint8_t)(q0 | (q1 << 4));
+        }
+    }
+}
+
+// quantize_q4_hqq_128 — multi-row entry point for the g128 variant.
+size_t quantize_q4_hqq_128(const float * GGML_RESTRICT src,
+                            void * GGML_RESTRICT dst,
+                            int64_t nrow,
+                            int64_t n_per_row,
+                            const float * quant_weights) {
+
+    if (!quant_weights) {
+        quantize_row_q4_hqq_128_ref(src, dst, (int64_t)nrow * n_per_row);
+        return nrow * ggml_row_size(GGML_TYPE_Q4_HQQ_128, n_per_row);
+    }
+
+    size_t row_size = ggml_row_size(GGML_TYPE_Q4_HQQ_128, n_per_row);
+    char * qrow = (char *) dst;
+
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q4_hqq_128_impl(src, (block_q4_hqq_128 *) qrow, n_per_row, quant_weights);
+        src  += n_per_row;
+        qrow += row_size;
+    }
+
+    return nrow * row_size;
+}
+
+// =============================================================================
+// End of Q4_HQQ_128 implementations
+// =============================================================================
 
 static void quantize_row_q5_0_impl(const float * GGML_RESTRICT x, block_q5_0 * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
     static_assert(QK5_0 == 32, "QK5_0 must be 32");

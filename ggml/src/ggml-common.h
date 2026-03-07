@@ -187,13 +187,32 @@ typedef struct {
 } block_q4_1;
 static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4_1 block size/padding");
 
+// Q4_HQQ: HQQ 4-bit quantization with group size 32 (g32).
+// Good for KV-cache quantization where small blocks are important.
+// Block layout: FP16 scale | FP16 zero | 16 bytes nibble-packed weights
+// = 20 bytes total = 5.0 bpw (4 bits weights + 0.5 bpw scale/zero overhead).
 #define QK4_HQQ 32
 typedef struct {
-    ggml_half scale;
-    ggml_half zero;
-    uint8_t qs[QK4_HQQ/2];
+    ggml_half scale;        // FP16 quantization scale:    s = 15/(max-min)
+    ggml_half zero;         // FP16 zero-point (HQQ-optimized): z = -min*s
+    uint8_t qs[QK4_HQQ/2]; // 4-bit nibble-packed weights, split-half layout
 } block_q4_hqq;
 static_assert(sizeof(block_q4_hqq) == 20, "wrong q4_hqq block size");
+
+// Q4_HQQ_128: HQQ 4-bit quantization with group size 128 (paper default g128).
+// Larger groups amortise the per-group overhead: 4 bytes scale+zero over 128
+// weights = 0.25 bpw overhead vs 0.5 bpw for g32.  Better bits-per-weight
+// efficiency at the cost of slightly coarser quantization granularity.
+// Recommended for weight matrices (MLP, attention projections).
+// Block layout: FP16 scale | FP16 zero | 64 bytes nibble-packed weights
+// = 68 bytes total = 4.25 bpw effective.
+#define QK4_HQQ_128 128
+typedef struct {
+    ggml_half scale;            // FP16 scale: s = 15/(max-min) over 128 weights
+    ggml_half zero;             // FP16 zero-point (HQQ-optimized over 128 weights)
+    uint8_t qs[QK4_HQQ_128/2]; // 4-bit nibble-packed weights, split-half layout
+} block_q4_hqq_128;
+static_assert(sizeof(block_q4_hqq_128) == 68, "wrong q4_hqq_128 block size");
 
 #define QK_MXFP4 32
 typedef struct {

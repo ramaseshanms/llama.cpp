@@ -239,7 +239,10 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
 #endif
     },
     [GGML_TYPE_Q4_HQQ] = {
-        .from_float               = quantize_row_q4_hqq_ref,
+        // g32: 5.0 bpw — recommended for KV-cache quantization.
+        // Use the void-pointer wrapper (quantize_row_q4_hqq) which calls
+        // quantize_row_q4_hqq_ref (now including the HQQ proximal solver).
+        .from_float               = quantize_row_q4_hqq,
         .vec_dot                  = ggml_vec_dot_q4_hqq_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
 #if defined (__ARM_FEATURE_MATMUL_INT8)
@@ -247,6 +250,15 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
 #else
         .nrows                    = 1,
 #endif
+    },
+    [GGML_TYPE_Q4_HQQ_128] = {
+        // g128: 4.25 bpw — paper default, recommended for weight matrices.
+        // Uses a dedicated vec_dot kernel that iterates over 4 Q8_0 sub-blocks
+        // per weight block (4 * 32 = 128 elements) with per-sub-block scaling.
+        .from_float               = quantize_row_q4_hqq_128,
+        .vec_dot                  = ggml_vec_dot_q4_hqq_128_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
     },
     [GGML_TYPE_Q5_0] = {
         .from_float               = quantize_row_q5_0,

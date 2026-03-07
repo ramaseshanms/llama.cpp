@@ -668,12 +668,25 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t) quantize_row_q4_1_ref,
     },
     [GGML_TYPE_Q4_HQQ] = {
+        // HQQ 4-bit g32: 5.0 bpw (4b weights + 0.5 bpw scale/zero overhead).
+        // Recommended for KV-cache quantization (small blocks, fast decode).
         .type_name                = "q4_hqq",
         .blck_size                = QK4_HQQ,
         .type_size                = sizeof(block_q4_hqq),
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_q4_hqq,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q4_hqq_ref,
+    },
+    [GGML_TYPE_Q4_HQQ_128] = {
+        // HQQ 4-bit g128: 4.25 bpw — the paper's default group size.
+        // Lower overhead (4 bytes scale+zero over 128 weights = 0.25 bpw)
+        // vs g32's 0.5 bpw, at the cost of coarser per-block statistics.
+        .type_name                = "q4_hqq_128",
+        .blck_size                = QK4_HQQ_128,
+        .type_size                = sizeof(block_q4_hqq_128),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_hqq_128,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_hqq_128_ref,
     },
     [4] = { // GGML_TYPE_Q4_2
         .type_name                = "DEPRECATED",
@@ -1376,7 +1389,8 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_BF16:          wtype = GGML_TYPE_BF16;  break;
         case GGML_FTYPE_MOSTLY_Q4_0:          wtype = GGML_TYPE_Q4_0;  break;
         case GGML_FTYPE_MOSTLY_Q4_1:          wtype = GGML_TYPE_Q4_1;  break;
-        case GGML_FTYPE_MOSTLY_Q4_HQQ:       wtype = GGML_TYPE_Q4_HQQ; break;
+        case GGML_FTYPE_MOSTLY_Q4_HQQ:       wtype = GGML_TYPE_Q4_HQQ;     break;
+        case GGML_FTYPE_MOSTLY_Q4_HQQ_128:   wtype = GGML_TYPE_Q4_HQQ_128; break;
         case GGML_FTYPE_MOSTLY_Q5_0:          wtype = GGML_TYPE_Q5_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_1:          wtype = GGML_TYPE_Q5_1;  break;
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
@@ -7593,7 +7607,8 @@ size_t ggml_quantize_chunk(
     switch (type) {
         case GGML_TYPE_Q4_0:    result = quantize_q4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q4_HQQ:  result = quantize_q4_hqq(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_HQQ:      result = quantize_q4_hqq    (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_HQQ_128:  result = quantize_q4_hqq_128(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_1:    result = quantize_q5_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_0:    result = quantize_q8_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

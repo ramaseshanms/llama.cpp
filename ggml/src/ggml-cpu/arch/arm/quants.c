@@ -523,6 +523,101 @@ void ggml_vec_dot_q4_hqq_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sumf;
 }
 
+// ggml_vec_dot_q4_hqq_128_q8_0 — NEON-accelerated dot product for g128.
+//
+// Each g128 weight block covers 128 elements (64 nibble bytes, split-half).
+// These map onto 4 consecutive Q8_0 activation blocks (4 * 32 = 128).
+// Per sub-block the pattern is identical to the g32 NEON kernel:
+//   vdotq_s32 on low+high nibbles vs activations → 4 int32 partial sums.
+void ggml_vec_dot_q4_hqq_128_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by,
+        int nrc) {
+    assert(n % QK4_HQQ_128 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const int nb128 = n / QK4_HQQ_128;
+
+    const block_q4_hqq_128 * GGML_RESTRICT x = vx;
+    const block_q8_0        * GGML_RESTRICT y = vy;
+
+    int ib = 0;
+    float sumf = 0.0f;
+
+#if defined(__ARM_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    const uint8x16_t m4b = vdupq_n_u8(0x0F);
+
+    for (; ib < nb128; ++ib) {
+        const float scale   = GGML_CPU_FP16_TO_FP32(x[ib].scale);
+        const float zero    = GGML_CPU_FP16_TO_FP32(x[ib].zero);
+        const int   iy_base = ib * (QK4_HQQ_128 / QK8_0);
+
+        // Process 4 Q8_0 sub-blocks (32 elements each).
+        for (int sub = 0; sub < QK4_HQQ_128 / QK8_0; ++sub) {
+            const int   qs_off = sub * (QK8_0 / 2);   // nibble-byte offset
+            const int   iy     = iy_base + sub;
+            const float factor = GGML_CPU_FP16_TO_FP32(y[iy].d) / scale;
+
+            // Unpack 16 nibble bytes for this sub-block.
+            const uint8x16_t q4b = vld1q_u8(x[ib].qs + qs_off);
+            const int8x16_t  qlo = vreinterpretq_s8_u8(vandq_u8(q4b, m4b));
+            const int8x16_t  qhi = vreinterpretq_s8_u8(vshrq_n_u8(q4b, 4));
+
+            // Load 32 activations for this sub-block.
+            const int8x16_t y_lo = vld1q_s8(y[iy].qs);
+            const int8x16_t y_hi = vld1q_s8(y[iy].qs + 16);
+
+            // sum(q*y): vdotq_s32 on low nibbles then high nibbles.
+            const int32x4_t dot = ggml_vdotq_s32(
+                                      ggml_vdotq_s32(vdupq_n_s32(0), qlo, y_lo),
+                                      qhi, y_hi);
+
+            // sum(y): pairwise int8->int16 add, combine, pairwise->int32.
+            int16x8_t sum16 = vpaddlq_s8(y_lo);
+            sum16 = vaddq_s16(sum16, vpaddlq_s8(y_hi));
+            const int32x4_t sum32 = vpaddlq_s16(sum16);
+
+            // acc += factor * (dot - zero * sum(y))
+            const float32x4_t vdot_f = vcvtq_f32_s32(dot);
+            const float32x4_t vsum_f = vcvtq_f32_s32(sum32);
+            acc = vmlaq_n_f32(acc,
+                              vsubq_f32(vdot_f, vmulq_n_f32(vsum_f, zero)),
+                              factor);
+        }
+    }
+
+    sumf = vaddvq_f32(acc);
+#endif
+
+    // Scalar tail (non-NEON or remainder).
+    for (; ib < nb128; ++ib) {
+        const float scale   = GGML_CPU_FP16_TO_FP32(x[ib].scale);
+        const float zero    = GGML_CPU_FP16_TO_FP32(x[ib].zero);
+        const int   iy_base = ib * (QK4_HQQ_128 / QK8_0);
+
+        for (int sub = 0; sub < QK4_HQQ_128 / QK8_0; ++sub) {
+            const int   qs_off = sub * (QK8_0 / 2);
+            const int   iy     = iy_base + sub;
+            const float factor = GGML_CPU_FP16_TO_FP32(y[iy].d) / scale;
+            int sumi_qy = 0, sumi_y = 0;
+            for (int j = 0; j < QK8_0/2; ++j) {
+                const int q0 = x[ib].qs[qs_off + j] & 0xF;
+                const int q1 = x[ib].qs[qs_off + j] >> 4;
+                sumi_qy += q0 * (int)y[iy].qs[j] + q1 * (int)y[iy].qs[j + QK8_0/2];
+                sumi_y  += (int)y[iy].qs[j] + (int)y[iy].qs[j + QK8_0/2];
+            }
+            sumf += factor * ((float)sumi_qy - zero * (float)sumi_y);
+        }
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_1;
     const int nb = n / qk;

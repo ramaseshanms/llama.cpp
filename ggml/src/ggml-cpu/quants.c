@@ -230,6 +230,117 @@ void ggml_vec_dot_q4_hqq_q8_0_generic(
     *s = sumf;
 }
 
+// ggml_vec_dot_q4_hqq_128_q8_0_generic — generic (non-SIMD) dot product for
+// the g128 variant.  The arithmetic is identical to the g32 generic kernel;
+// the only difference is the block struct type (block_q4_hqq_128) and the
+// number of inner-loop iterations (64 nibble bytes = 128 weights per block).
+//
+// Dequant formula: w_j = (q_j - zero) / scale
+// Dot product reformulation (same as g32):
+//   sum_j w_j * y_j = (yd/scale) * (sum_j q_j*y_j - zero * sum_j y_j)
+// This hoists the per-element division out of the loop.
+//
+// Each Q8_0 block covers 32 activations.  One g128 weight block spans
+// 128 weights, so we process QK4_HQQ_128 / QK8_0 = 4 Q8_0 blocks per
+// weight block.
+void ggml_vec_dot_q4_hqq_128_q8_0_generic(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by,
+        int nrc) {
+
+    // n must be divisible by QK4_HQQ_128 = 128 (the weight block size).
+    // Each weight block maps onto QK4_HQQ_128/QK8_0 = 4 Q8_0 activation blocks.
+    assert(n % QK4_HQQ_128 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const int nb128 = n / QK4_HQQ_128;     // number of weight blocks (g128)
+    const int nb8   = n / QK8_0;           // number of activation blocks (Q8_0)
+
+    const block_q4_hqq_128 * x = (const block_q4_hqq_128 *) vx;
+    const block_q8_0        * y = (const block_q8_0        *) vy;
+
+    float sumf = 0.0f;
+
+    // Iterate over g128 weight blocks.  Each block contains 128 weights and
+    // spans 4 consecutive Q8_0 activation blocks (4 * 32 = 128 elements).
+    for (int ib = 0; ib < nb128; ++ib) {
+        const float scale = GGML_FP16_TO_FP32(x[ib].scale);
+        const float zero  = GGML_FP16_TO_FP32(x[ib].zero);
+        // pre-compute the shared scalar; yd varies per Q8_0 sub-block below
+        // full formula per sub-block: (y[iy].d / scale) * (sumi_qy - zero*sumi_y)
+
+        // Split-half packing: qs[0..63] = low nibbles for elements 0..63,
+        //                     qs[0..63] high nibbles = elements 64..127.
+        // We iterate over all 64 nibble bytes to accumulate dot product.
+        // The 128 activations are in 4 consecutive Q8_0 blocks.
+        // We accumulate sumi_qy and sumi_y over the full 128-element block,
+        // but must weight each sub-block's contribution by its own y[iy].d.
+        //
+        // Because each Q8_0 block has its own scale y[iy].d, we cannot
+        // combine them into a single integer accumulator.  Instead we process
+        // 4 Q8_0 sub-blocks, each covering 32 elements of the 128-weight block.
+
+        const int iy_base = ib * (QK4_HQQ_128 / QK8_0); // first Q8_0 block index
+
+        for (int sub = 0; sub < QK4_HQQ_128 / QK8_0; ++sub) {
+            // sub-block covers elements [sub*32 .. sub*32+31] of this g128 block.
+            const int    elem_off = sub * QK8_0;          // element offset in block
+            const int    qs_off   = elem_off / 2;         // nibble-byte offset
+            const int    iy       = iy_base + sub;
+            const float  factor   = GGML_FP16_TO_FP32(y[iy].d) / scale;
+
+            int sumi_qy = 0;
+            int sumi_y  = 0;
+
+            // 16 nibble bytes cover the 32 weights of this sub-block:
+            //   qs[qs_off + j] low  nibble = element elem_off + j
+            //   qs[qs_off + j] high nibble = element elem_off + j + QK4_HQQ_128/2
+            // The activations y[iy].qs[0..31] are laid out sequentially.
+            for (int j = 0; j < QK8_0/2; ++j) {
+                const int q0 = x[ib].qs[qs_off + j] & 0xF;
+                const int q1 = x[ib].qs[qs_off + j] >> 4;
+
+                sumi_qy += q0 * (int)y[iy].qs[j];
+                sumi_qy += q1 * (int)y[iy].qs[j + QK8_0/2];
+                sumi_y  += (int)y[iy].qs[j];
+                sumi_y  += (int)y[iy].qs[j + QK8_0/2];
+            }
+
+            sumf += factor * ((float)sumi_qy - zero * (float)sumi_y);
+        }
+    }
+
+    // Handle any remaining elements that don't fit a full g128 block.
+    // (In practice n is always a multiple of 128 for weight matrices, but the
+    //  scalar tail guards against misaligned test inputs.)
+    const int done = nb128 * QK4_HQQ_128;
+    if (done < n) {
+        // Fall back to g32 generic for the tail — not expected in production.
+        const int tail_nb = (n - done) / QK8_0;
+        const block_q4_hqq * xt = (const block_q4_hqq *)((const char *)vx + nb128 * sizeof(block_q4_hqq_128));
+        const block_q8_0   * yt = y + nb128 * (QK4_HQQ_128 / QK8_0);
+        for (int ib = 0; ib < tail_nb; ++ib) {
+            const float scale  = GGML_FP16_TO_FP32(xt[ib].scale);
+            const float zero   = GGML_FP16_TO_FP32(xt[ib].zero);
+            const float factor = GGML_FP16_TO_FP32(yt[ib].d) / scale;
+            int sumi_qy = 0, sumi_y = 0;
+            for (int j = 0; j < 16; ++j) {
+                sumi_qy += (xt[ib].qs[j] & 0xF) * (int)yt[ib].qs[j];
+                sumi_qy += (xt[ib].qs[j] >> 4)  * (int)yt[ib].qs[j + 16];
+                sumi_y  += (int)yt[ib].qs[j] + (int)yt[ib].qs[j + 16];
+            }
+            sumf += factor * ((float)sumi_qy - zero * (float)sumi_y);
+        }
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_mxfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
