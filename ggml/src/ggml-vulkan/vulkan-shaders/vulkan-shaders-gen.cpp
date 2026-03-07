@@ -66,6 +66,12 @@ const std::vector<std::string> type_names = {
     "iq4_nl",
     "mxfp4",
     "bf16",
+    // Q4_HQQ: HQQ 4-bit quantization, group sizes 32 (g32) and 128 (g128).
+    // Both use split-half nibble layout and the mul_mat_vec.comp fast path
+    // (DATA_A_QUANT_LEGACY). get_dm() yields (1/scale, -zero/scale) so that
+    // the standard v*dm.x+dm.y path reconstructs (q-zero)/scale correctly.
+    "q4_hqq",
+    "q4_hqq_128",
 };
 
 enum MatMulIdType {
@@ -220,7 +226,11 @@ bool is_quantized_type(const std::string& type_name) {
 }
 
 bool is_legacy_quant(const std::string& type_name) {
-    return type_name == "q4_0" || type_name == "q4_1" || type_name == "q5_0" || type_name == "q5_1" || type_name == "q8_0";
+    // Legacy quants use the standard mul_mat_vec.comp path (not K-quant specialisations).
+    // Q4_HQQ and Q4_HQQ_128 are treated as legacy quants: same split-half nibble layout
+    // as Q4_0/Q4_1, with get_dm() supplying the scale/zero reconstruction coefficients.
+    return type_name == "q4_0" || type_name == "q4_1" || type_name == "q5_0" || type_name == "q5_1" || type_name == "q8_0"
+        || type_name == "q4_hqq" || type_name == "q4_hqq_128";
 }
 
 bool is_k_quant(const std::string& type_name) {
@@ -587,7 +597,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
         // Integer dot mmq performs better with f32 accumulators
-        if (!f16acc && !coopmat && !coopmat2 && (is_legacy_quant(tname) || is_k_quant(tname) || tname == "mxfp4")) {
+        // Q4_HQQ uses (q-zero)/scale which is incompatible with the integer-accumulation
+        // scheme in mul_mmq.comp (which assumes d*(q - offset) form). Exclude it.
+        const bool tname_no_mmq = (tname == "q4_hqq" || tname == "q4_hqq_128");
+        if (!f16acc && !coopmat && !coopmat2 && (is_legacy_quant(tname) || is_k_quant(tname) || tname == "mxfp4") && !tname_no_mmq) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
         }
 #endif
@@ -697,7 +710,11 @@ void process_shaders() {
 
         // mul mat vec with integer dot product
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-        if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m") {
+        // Q4_HQQ uses (q - zero) / scale reconstruction, not the integer-accumulation
+        // scheme expected by mul_mat_vecq.comp (which assumes d*(q - offset) form).
+        // Exclude Q4_HQQ from the mmq integer dot-product path for correctness.
+        const bool is_q4_hqq_type = (tname == "q4_hqq" || tname == "q4_hqq_128");
+        if ((is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m") && !is_q4_hqq_type) {
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPE_VEC2", "vec2"}, {"ACC_TYPE", "float"}}));
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPE_VEC2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPE_VEC2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
@@ -1139,7 +1156,8 @@ void write_output_files() {
 
     for (const std::string& btype : btypes) {
     for (const auto& tname : type_names) {
-        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m") {
+        // Q4_HQQ uses (q-zero)/scale reconstruction and cannot use integer dot-product mmvq path
+        if (btype == "q8_1" && (!is_legacy_quant(tname) || tname == "q4_hqq" || tname == "q4_hqq_128") && tname != "mxfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m") {
             continue;
         }
         hdr << "extern const void * arr_dmmv_"   << tname << "_" << btype << "_f32_data[3];\n";
