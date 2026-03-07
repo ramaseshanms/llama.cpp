@@ -395,7 +395,16 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1,
+    // Q4_HQQ: HQQ 4-bit, group-size 32 (5.0 bpw).  Identical memory
+    // footprint to Q4_1 but uses the HQQ half-quadratic proximal solver
+    // for better weight quantisation accuracy.  For KV cache use see
+    // docs/kv-cache-q4-hqq.md for quality trade-offs.
     GGML_TYPE_Q4_HQQ,
+    // Q4_HQQ_128: HQQ 4-bit, group-size 128 (4.25 bpw, paper default).
+    // Larger group size → smaller metadata overhead, lower bit-rate, but
+    // same potential DC-bias quality issue as Q4_HQQ on Llama-3.
+    // Requires n_embd_head % 128 == 0 (true for head sizes 128, 256).
+    GGML_TYPE_Q4_HQQ_128,
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
