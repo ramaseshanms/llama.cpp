@@ -496,6 +496,12 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "q4_hqq") {
         return GGML_TYPE_Q4_HQQ;
     }
+    // Q4_HQQ_128: HQQ 4-bit group-size-128 variant (4.25 bpw, paper default).
+    // llama-bench has its own static ggml_type_from_name() that is separate
+    // from the one in common/arg.cpp; both must be kept in sync.
+    if (s == "q4_hqq_128") {
+        return GGML_TYPE_Q4_HQQ_128;
+    }
 
     return GGML_TYPE_COUNT;
 }
