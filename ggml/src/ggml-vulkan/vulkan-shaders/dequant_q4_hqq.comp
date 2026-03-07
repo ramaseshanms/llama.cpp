@@ -1,0 +1,78 @@
+// dequant_q4_hqq.comp
+// Vulkan compute shader: dequantize Q4_HQQ (g32) blocks → FP16 output.
+//
+// Q4_HQQ block layout (20 bytes):
+//   float16_t scale   [offset 0, 2 bytes]  — scale = 15 / (max - min)
+//   uint8_t   zero    [offset 2, 1 byte ]  — integer zero-point in [0, 15]
+//   uint8_t   _pad    [offset 3, 1 byte ]  — always 0
+//   uint8_t   qs[16]  [offset 4, 16 bytes] — split-half nibble-packed weights
+//
+// Split-half nibble layout (same convention as Q4_0 in llama.cpp):
+//   qs[j] & 0xF  = element j       (j in [0, 15], first  half of 32-elem block)
+//   qs[j] >> 4   = element j + 16  (j in [0, 15], second half of 32-elem block)
+//
+// Dequantize formula: w = (q - zero) / scale
+//
+// Dispatch: each workgroup (256 threads) processes 4 blocks.
+//   - Threads are split into groups of 64; each group handles one block.
+//   - Within a group: il=0/1 selects the lo/hi nibble half; ir selects the byte.
+//
+// Output buffer D holds FP16 dequantized values in row-major order.
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Input: array of Q4_HQQ blocks.
+layout (binding = 0) readonly buffer A {block_q4_hqq data_a[];};
+// Output: dequantized values in D_TYPE (float16_t by default).
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    // Each workgroup covers 4 blocks (256 threads / 64 threads-per-block).
+    const uint i   = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
+    const uint tid = gl_LocalInvocationID.x % 64;
+
+    // il selects which nibble half (0 = low nibbles → elements 0..15,
+    //                               1 = high nibbles → elements 16..31).
+    const uint il  = tid / 32;
+    // ir selects which of the 32 blocks in the row this thread outputs to.
+    const uint ir  = tid % 32;
+
+    // Block index in the A buffer.
+    const uint ib  = 32 * i + ir;
+    if (ib >= p.nel / QUANT_K_Q4_HQQ) {
+        return;
+    }
+
+    // Base qs byte index: each thread processes 8 consecutive qs bytes.
+    // il=0 → qs[0..7], il=1 → qs[8..15].
+    const uint q_idx = 8 * il;
+
+    // Base output index for this thread's 16 output values.
+    // Output layout: block i has QUANT_K_Q4_HQQ (=32) elements.
+    // b_idx = block_start * 32 + half_offset.
+    // Within a block: first half (il=0) at offsets 0..7 (lo) and 16..23 (hi),
+    //                 second half (il=1) at offsets 8..15 (lo) and 24..31 (hi).
+    const uint b_idx = 1024 * i + 32 * ir + q_idx;
+
+    // Read scale and zero-point for this block.
+    const float inv_scale = 1.0f / float(data_a[ib].scale);
+    const float zero      = float(data_a[ib].zero);
+
+    // Process 8 qs bytes, each contributing 2 output elements.
+    [[unroll]] for (uint l = 0; l < 8; ++l) {
+        const uint byte_val = uint(data_a[ib].qs[q_idx + l]);
+
+        // Low nibble  → element at position (q_idx + l) in the block.
+        // High nibble → element at position (q_idx + l + 16) in the block.
+        const float w_lo = (float(byte_val & 0xF) - zero) * inv_scale;
+        const float w_hi = (float(byte_val >>  4) - zero) * inv_scale;
+
+        // First half: output at b_idx + l (stride 1 within the 8-element group).
+        // Second half: output at b_idx + l + 16 (split-half stride).
+        data_b[b_idx + l     ] = D_TYPE(w_lo);
+        data_b[b_idx + l + 16] = D_TYPE(w_hi);
+    }
+}

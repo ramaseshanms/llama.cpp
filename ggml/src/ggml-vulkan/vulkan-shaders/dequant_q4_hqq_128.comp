@@ -1,0 +1,65 @@
+// dequant_q4_hqq_128.comp
+// Vulkan compute shader: dequantize Q4_HQQ_128 (g128) blocks → FP16 output.
+//
+// Q4_HQQ_128 block layout (68 bytes):
+//   float16_t scale   [offset 0, 2 bytes]  — scale = 15 / (max - min)
+//   uint8_t   zero    [offset 2, 1 byte ]  — integer zero-point in [0, 15]
+//   uint8_t   _pad    [offset 3, 1 byte ]  — always 0
+//   uint8_t   qs[64]  [offset 4, 64 bytes] — split-half nibble-packed weights
+//
+// Split-half nibble layout:
+//   qs[j] & 0xF  = element j       (j in [0, 63], first  half of 128-elem block)
+//   qs[j] >> 4   = element j + 64  (j in [0, 63], second half of 128-elem block)
+//
+// Dequantize formula: w = (q - zero) / scale
+//
+// Dispatch: each workgroup (256 threads) processes 2 blocks.
+//   QUANT_K_Q4_HQQ_128 = 128 elements/block → 64 qs bytes/block.
+//   256 threads / 128 threads-per-block = 2 blocks per workgroup.
+//   Each thread processes 1 qs byte (2 output elements).
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Input: array of Q4_HQQ_128 blocks.
+layout (binding = 0) readonly buffer A {block_q4_hqq_128 data_a[];};
+// Output: dequantized values in D_TYPE (float16_t by default).
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    // Each workgroup covers 2 blocks (256 threads / 128 threads-per-block).
+    const uint i   = gl_WorkGroupID.x * 2 + gl_LocalInvocationID.x / 128;
+    const uint tid = gl_LocalInvocationID.x % 128;
+
+    // Block index in the A buffer.
+    const uint ib  = i;
+    if (ib >= p.nel / QUANT_K_Q4_HQQ_128) {
+        return;
+    }
+
+    // Each thread handles exactly one qs byte.
+    // tid is the byte index within the block (0..63 = low nibbles → first half,
+    // 64..127 is unused here; instead we use split-half: tid in [0,63] handles
+    // qs[tid], producing elements tid (lo) and tid+64 (hi)).
+    if (tid >= 64) {
+        return; // Only 64 qs bytes per block; upper 64 threads idle.
+    }
+
+    const uint q_byte = uint(data_a[ib].qs[tid]);
+
+    // Read scale and zero-point.
+    const float inv_scale = 1.0f / float(data_a[ib].scale);
+    const float zero      = float(data_a[ib].zero);
+
+    // Dequantize low and high nibble.
+    const float w_lo = (float(q_byte & 0xF) - zero) * inv_scale;
+    const float w_hi = (float(q_byte >>  4) - zero) * inv_scale;
+
+    // Write to output buffer.
+    // Block i starts at output index i * QUANT_K_Q4_HQQ_128.
+    const uint out_base = i * QUANT_K_Q4_HQQ_128;
+    data_b[out_base + tid     ] = D_TYPE(w_lo); // element tid       (first half)
+    data_b[out_base + tid + 64] = D_TYPE(w_hi); // element tid + 64  (second half)
+}

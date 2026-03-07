@@ -188,6 +188,85 @@ struct block_q8_0_packed16
 #define DATA_A_QUANT_LEGACY
 #endif
 
+// ── Q4_HQQ g32 (group size 32, 5.0 bpw) ─────────────────────────────────────
+// Block layout mirrors the C struct block_q4_hqq (20 bytes):
+//   float16_t scale   — s = 15 / (max - min)
+//   uint8_t   zero    — integer zero-point (HQQ proximal solver), range [0,15]
+//   uint8_t   _pad    — always 0, keeps 20-byte size
+//   uint8_t   qs[16]  — 4-bit nibble-packed weights, SPLIT-HALF layout:
+//                         qs[j] & 0xF  = element j          (j in [0,15])
+//                         qs[j] >> 4   = element j+16        (j in [0,15])
+// Dequantize: w = (q - zero) / scale
+#define QUANT_K_Q4_HQQ 32
+#define QUANT_R_Q4_HQQ 2
+
+struct block_q4_hqq
+{
+    float16_t scale;  // FP16 scale factor
+    uint8_t   zero;   // INT8 zero-point
+    uint8_t   _pad;   // padding (always 0)
+    uint8_t   qs[16]; // 4-bit nibble-packed weights (split-half layout)
+};
+
+// Packed variant: two consecutive qs bytes packed into one uint16_t for
+// efficient 16-bit loads in the dequantize4() path.
+struct block_q4_hqq_packed16
+{
+    float16_t scale;
+    uint8_t   zero;
+    uint8_t   _pad;
+    uint16_t  qs[8]; // 16 bytes of qs as 8 uint16_t values
+};
+
+#if defined(DATA_A_Q4_HQQ)
+#define QUANT_K QUANT_K_Q4_HQQ
+#define QUANT_R QUANT_R_Q4_HQQ
+// QUANT_AUXF = 2: block has scale + zero, so dm.y is used (like Q4_1)
+#define QUANT_AUXF 2
+#define A_TYPE block_q4_hqq
+#define A_TYPE_PACKED16 block_q4_hqq_packed16
+// DATA_A_QUANT_LEGACY: enables the standard mul_mat_vec.comp path (not K-quant)
+#define DATA_A_QUANT_LEGACY
+#endif
+
+// ── Q4_HQQ_128 g128 (group size 128, 4.25 bpw, paper default) ────────────────
+// Block layout mirrors the C struct block_q4_hqq_128 (68 bytes):
+//   float16_t scale       — s = 15 / (max - min) over 128 weights
+//   uint8_t   zero        — integer zero-point, range [0,15]
+//   uint8_t   _pad        — always 0, keeps 68-byte size
+//   uint8_t   qs[64]      — 4-bit nibble-packed weights, SPLIT-HALF layout:
+//                             qs[j] & 0xF = element j        (j in [0,63])
+//                             qs[j] >> 4  = element j+64     (j in [0,63])
+// Dequantize: w = (q - zero) / scale   (same formula, larger group)
+#define QUANT_K_Q4_HQQ_128 128
+#define QUANT_R_Q4_HQQ_128 2
+
+struct block_q4_hqq_128
+{
+    float16_t scale;  // FP16 scale factor
+    uint8_t   zero;   // INT8 zero-point
+    uint8_t   _pad;   // padding (always 0)
+    uint8_t   qs[64]; // 4-bit nibble-packed weights (split-half layout)
+};
+
+// Packed variant: two consecutive qs bytes packed into one uint16_t.
+struct block_q4_hqq_128_packed16
+{
+    float16_t scale;
+    uint8_t   zero;
+    uint8_t   _pad;
+    uint16_t  qs[32]; // 64 bytes of qs as 32 uint16_t values
+};
+
+#if defined(DATA_A_Q4_HQQ_128)
+#define QUANT_K QUANT_K_Q4_HQQ_128
+#define QUANT_R QUANT_R_Q4_HQQ_128
+#define QUANT_AUXF 2
+#define A_TYPE block_q4_hqq_128
+#define A_TYPE_PACKED16 block_q4_hqq_128_packed16
+#define DATA_A_QUANT_LEGACY
+#endif
+
 #define QUANT_K_Q8_1 32
 #define QUANT_R_Q8_1 1
 

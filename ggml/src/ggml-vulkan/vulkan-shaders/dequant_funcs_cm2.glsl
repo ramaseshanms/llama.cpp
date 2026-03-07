@@ -666,6 +666,56 @@ float16_t dequantFuncIQ4_NL(const in decodeBufIQ4_NL bl, const in uint blockCoor
 }
 #endif
 
+// ── Q4_HQQ g32 cooperative-matrix-2 dequant ──────────────────────────────────
+// Block: float16_t scale | uint8_t zero | uint8_t _pad | uint8_t qs[16]
+// Total: 20 bytes.  align=4 (next power-of-2 ≥ 2 for float16_t + uint8_t padding)
+// Dequantize: w = (q - zero) / scale
+//   idx 0-15  → low  nibble of qs[idx]      (element idx)
+//   idx 16-31 → high nibble of qs[idx-16]   (element idx)
+#if defined(DATA_A_Q4_HQQ)
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer decodeBufQ4_HQQ {
+   block_q4_hqq block;
+};
+
+float16_t dequantFuncQ4_HQQ(const in decodeBufQ4_HQQ bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float16_t scale = bl.block.scale;
+    const float16_t zero  = float16_t(bl.block.zero);
+    const uint idx   = coordInBlock[1];
+    const uint iqs   = idx & 0xF;          // byte index into qs[] (0-15)
+    const uint shift = (idx & 0x10) >> 2;  // 0 for low half, 4 for high half
+    uint32_t qs = bl.block.qs[iqs];
+    qs >>= shift;
+    qs &= 0xF;
+    return (float16_t(qs) - zero) / scale;
+}
+#endif
+
+// ── Q4_HQQ_128 g128 cooperative-matrix-2 dequant ─────────────────────────────
+// Block: float16_t scale | uint8_t zero | uint8_t _pad | uint8_t qs[64]
+// Total: 68 bytes. align=4
+// Same formula, 128-element group.
+//   idx 0-63  → low  nibble of qs[idx]      (element idx)
+//   idx 64-127→ high nibble of qs[idx-64]   (element idx)
+#if defined(DATA_A_Q4_HQQ_128)
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer decodeBufQ4_HQQ_128 {
+   block_q4_hqq_128 block;
+};
+
+float16_t dequantFuncQ4_HQQ_128(const in decodeBufQ4_HQQ_128 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float16_t scale = bl.block.scale;
+    const float16_t zero  = float16_t(bl.block.zero);
+    const uint idx   = coordInBlock[1];
+    const uint iqs   = idx & 0x3F;         // byte index into qs[] (0-63)
+    const uint shift = (idx & 0x40) >> 4;  // 0 for low 64, 4 for high 64
+    uint32_t qs = bl.block.qs[iqs];
+    qs >>= shift;
+    qs &= 0xF;
+    return (float16_t(qs) - zero) / scale;
+}
+#endif
+
 #if defined(DATA_A_MXFP4)
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufMXFP4 {
    block_mxfp4 block;
@@ -729,6 +779,11 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
 #define dequantFuncA dequantFuncIQ4_NL
 #elif defined(DATA_A_MXFP4)
 #define dequantFuncA dequantFuncMXFP4
+// Q4_HQQ uses (q-zero)/scale dequantization; both g32 and g128 variants supported
+#elif defined(DATA_A_Q4_HQQ)
+#define dequantFuncA dequantFuncQ4_HQQ
+#elif defined(DATA_A_Q4_HQQ_128)
+#define dequantFuncA dequantFuncQ4_HQQ_128
 #elif defined(DATA_A_F32)
 #define dequantFuncA dequantFuncF32
 #endif

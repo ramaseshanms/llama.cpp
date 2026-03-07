@@ -44,6 +44,67 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+// ── Q4_HQQ g32 dequantize functions ──────────────────────────────────────────
+// Split-half nibble layout (identical to Q4_0):
+//   qs[j] & 0xF  = element j          (first  half, j in [0, 15])
+//   qs[j] >> 4   = element j + 16     (second half, j in [0, 15])
+//
+// Reconstruction formula: w = (q - zero) / scale
+// Implemented via get_dm(): dm.x = 1/scale, dm.y = -zero/scale
+// so that mul_mat_vec.comp computes: w = q * dm.x + dm.y = (q - zero)/scale
+//
+// dequantize(ib, iqs, offset):
+//   Returns raw nibbles for elements at column iqs and iqs+QK/2 (= iqs+16).
+//   iqs is in [0, QK4_HQQ/2 - 1] = [0, 15]; caller maps col → iqs = col%QK/QUANT_R.
+//
+// dequantize4(ib, iqs, offset):
+//   Returns 4 raw nibbles from two consecutive qs bytes using a packed-16 load.
+//   Ordering: (elem iqs, elem iqs+16, elem iqs+1, elem iqs+17) — matches the
+//   interleaved B-vector load pattern in mul_mat_vec.comp (QUANT_R=2, y_offset=16).
+#if defined(DATA_A_Q4_HQQ)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    // qs[iqs] & 0xF = element iqs (low nibble)
+    // qs[iqs] >> 4  = element iqs + QK4_HQQ/2 (high nibble)
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
+    return vec2(vui & 0xF, vui >> 4);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    // Load two consecutive qs bytes as one uint16_t for efficiency.
+    // vui bits [0..7]  = qs[iqs],   bits [8..15] = qs[iqs+1]
+    // Returns: (elem iqs, elem iqs+16, elem iqs+1, elem iqs+17)
+    const uint vui = uint(data_a_packed16[a_offset + ib].qs[iqs/2]);
+    return vec4(vui & 0xF, (vui >> 4) & 0xF, (vui >> 8) & 0xF, vui >> 12);
+}
+// get_dm for Q4_HQQ: convert (scale, zero) → (inv_scale, -zero*inv_scale)
+// so that: q * dm.x + dm.y = q/scale - zero/scale = (q - zero)/scale ✓
+vec2 get_dm(uint ib, uint a_offset) {
+    const float inv_scale = 1.0f / float(data_a[a_offset + ib].scale);
+    const float zero_f    = float(data_a[a_offset + ib].zero);
+    return vec2(inv_scale, -zero_f * inv_scale);
+}
+#endif
+
+// ── Q4_HQQ_128 g128 dequantize functions ─────────────────────────────────────
+// Same split-half nibble layout but group size = 128:
+//   qs[j] & 0xF = element j         (j in [0, 63])
+//   qs[j] >> 4  = element j + 64    (j in [0, 63])
+// Reconstruction: w = (q - zero) / scale   (same formula, larger block)
+#if defined(DATA_A_Q4_HQQ_128)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
+    return vec2(vui & 0xF, vui >> 4);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a_packed16[a_offset + ib].qs[iqs/2]);
+    return vec4(vui & 0xF, (vui >> 4) & 0xF, (vui >> 8) & 0xF, vui >> 12);
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    const float inv_scale = 1.0f / float(data_a[a_offset + ib].scale);
+    const float zero_f    = float(data_a[a_offset + ib].zero);
+    return vec2(inv_scale, -zero_f * inv_scale);
+}
+#endif
+
 #if defined(DATA_A_Q5_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint uint_qh = uint(data_a[a_offset + ib].qh[1]) << 16 | data_a[a_offset + ib].qh[0];
